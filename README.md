@@ -1,5 +1,9 @@
 # Ferrous Goose
 
+<p align="center">
+  <img src="assets/mascot.png" width="280" alt="Ferrous Goose mascot: an armored white goose carrying an orange crab.">
+</p>
+
 Call Rust crates from Goose, or embed Goose in Rust, using generated
 bindings. User code needs no C wrappers, headers or unsafe Rust.
 
