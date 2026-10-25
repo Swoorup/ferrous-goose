@@ -1,79 +1,60 @@
-# The phases, and where each stands
+# Implementation and validation
 
-What each phase of the proposal promised, what implements it, and what
-checks it. "Tested" means a test in this repository runs it; the platform
-column says where it has run.
+This file records test coverage and platform runs. Supported API types are
+listed in the [type map](type-map.md).
 
-## Phase 1: the Rust crates (no Goose changes)
+## Latest validation: 2026-10-26
 
-| Promise | Where | Tested |
-|---|---|---|
-| The `goose` crate: `GooseSlice`, the borrows that check alignment, UTF-8 and overlap with an aligned copy fallback, `GooseBuf`, `Runtime`, generation-checked handle tables with live counts, the panic catcher | `crates/goose` | `crates/goose/tests/runtime.rs` |
-| `#[goose::export]`, `#[goose::handle]`, `#[derive(goose::Flat)]` | `crates/goose-macros` | `conformance/rust/tests/shims.rs`, the conformance suite |
-| `cargo goose bindings`: struct declarations with pads, the extern block, the wrappers, the crate's namespace, doc comments | `crates/cargo-goose` | `conformance/rust/tests/bindings.rs` |
-| The regex example runs with no hand-written glue | `examples/regex` | macOS and Linux (arm64) |
-| A conformance suite covering every row of the type map, unaligned and overlapping arguments, panics and stale handles | `conformance/rust/goose-tests` | 23 programs on the stock compiler, 28 on the patched one |
+On macOS arm64, `SKIP_PACKAGES=1 scripts/check.sh` passed:
 
-## Phase 2: Cargo and Goose meet halfway
+| Check | Result |
+|---|---|
+| Workspace tests | Passed, including compile-fail fixtures, strict borrowing/allocation tests and mandatory layout verification |
+| Goose calling Rust, stock compiler | 23 passed, 8 skipped for unavailable compiler features |
+| Goose calling Rust, patched compiler | 31 passed |
+| Rust calling Goose | 14 basic checks on stock; 24 full checks on patched |
+| Plain C native provider | JIT/native builds, runtime hooks, typed builders and rejection cases passed |
+| Rust native provider | One-crate and combined two-crate programs passed under `goose run` and `goose build` |
 
-| Promise | Where | Tested |
-|---|---|---|
-| `native_build` provider command: `goose build` links a staticlib, `goose run` builds and loads a library | goose-patches/0005, `cargo goose native` | `examples/regex/linked` (run and build) |
-| Several crates in one program, linked as one static library | goose-patches/0005, `cargo goose combine` | `examples/multi` (run and build) |
-| Typed builders, `T[>..]&` of flat T | goose-patches/0001, `goose::GooseVec` | `typed_builders.goose`, `vecs.goose` |
-| Richer exports: several results, builders with a runtime scratch builder | goose-patches/0002, `goose_build` | `conformance/embed` (full) |
-| `goose check --emit-interface json` | goose-patches/0003 | `goose_build`, `cargo goose`'s layout check and its test |
-| An exported `gs_abort`: panics end the program, or a contained worker, like a Goose abort | goose-patches/0004 | `contained.goose`, `leaks_at_end.goose` |
-| `align n` for structs | goose-patches/0007 | `align.goose` (no copies), `conformance/embed` (aligned mirror) |
-| Rust-embeds-Goose: `goose_build`, `goose::include!`, `Runtime` | `crates/goose-build` | `examples/embed`, `conformance/embed` (basic on stock, full patched) |
+A strict host package was also built and used without Rust on PATH.
+Packaging strict exports for a foreign target was rejected before the
+foreign build, as required by the current layout-verification policy.
 
-## Phase 3: richer types
+The generic compiler patch series passed 4,763 baseline checks before the
+strict Rust attribute was added. The strict implementation made no further
+compiler changes. Optional graphics, audio, physics and UI layers were not
+built for that run.
 
-| Promise | Where | Tested |
-|---|---|---|
-| Enums with data, converted at the boundary; slices in one pass | `#[derive(Flat)]` | `enums.goose`, `shims.rs` |
-| `align n` for enums: zero-copy enums with data | goose-patches/0007, `#[goose(align)]` | `align.goose` |
-| Generic functions through instantiation lists | `instantiate(..)` | `generics.goose` |
-| Iterators: span lists with block-taking wrappers; lazy handle iterators | `impl Iterator` results | `iterators.goose` |
-| Optional parameters | `Option<..>` parameters | `optionals.goose` |
-| Callbacks: Rust calls the program's export fns while Goose waits on it, through the runtime change (nested calls above every live stack top) and a re-entry token | goose-patches/0008, `&goose::Reentry`, `goose::callbacks!` ([design](design.md#callbacks)) | `reentry.goose`, `bindings.rs` (`calling_back_is_reentrant`) |
-| Closures as callbacks, on the stock compiler too | coroutines | `callbacks.goose` |
-| Leak reports: live counts for tests, a report at the end in debug builds | handle tables, goose-patches/0004 | `handles.goose`, `leaks_at_end.goose` |
+The full package distribution was not rebuilt during this validation.
+Current native-provider and strict-export behavior has not been tested on
+Linux or Windows.
 
-Done when each of these has a conformance test, and the type map rejects
-only async functions and Rust closures kept as values (and the few shapes
-[type-map.md](type-map.md#still-rejected) lists).
+## Coverage by feature
 
-## Phase 4: an ecosystem
-
-| Promise | Where | Tested |
-|---|---|---|
-| Wrapper packages over regex, serde_json, image and rusqlite, each with its module and a prebuilt library per platform and architecture | `packages/*`, `cargo goose package`, goose-patches/0006 | examples run with no cargo or rustc on PATH on macOS (arm64) and Linux (arm64); libraries built for macOS (universal), Linux (x86_64, arm64) and Windows (x86_64) |
-| `cargo goose new` and `cargo goose test` | `crates/cargo-goose` | a scaffolded crate's test passes |
-| Versioning: format and ABI versions in records and symbols | `goose::abi`, `goose_abi_1` | `bindings.rs` (`versions_are_checked`) |
-| Strict `#[goose::export(zero_copy)]` exports | macros, no-copy argument holders, mandatory layout verification | compile-fail fixtures, strict shim/allocation tests and `zero_copy.goose` |
-| An overhead budget, measured and published | `bench/` | `bench/RESULTS.md` |
-
-Done when someone with no Rust installed imports a crate-backed package and
-runs it on Windows, macOS and Linux. Met on macOS and Linux (arm64):
-`scripts/check.sh` runs every package's example under `env -i
-PATH=/usr/bin:/bin`, after checking that no cargo or rustc is on it. Not met
-on Windows: the libraries are built for it, but nothing has run there.
-
-The platform history below describes the original series. The generic
-native-build protocol was validated on macOS arm64 on 2026-10-26:
-workspace tests, both conformance directions, C and Rust native providers
-(JIT and native executables), multi-crate combination and Goose's baseline
-suite passed. Package distribution was not rebuilt, and the generic
-protocol has not been exercised on Linux or Windows.
+| Feature | Implementation and tests |
+|---|---|
+| Arguments, builders, handle tables and panic handling | [Runtime tests](../crates/goose/tests/runtime.rs), [shim tests](../conformance/rust/tests/shims.rs) |
+| Export, handle and flat-type macros | [Macros](../crates/goose-macros/src), [rejection fixtures](../crates/goose/tests/ui) |
+| Metadata, generated layouts and version checks | [Binding tests](../conformance/rust/tests/bindings.rs) |
+| Native-build providers and crate combination | [C provider test](../scripts/check-native-build.py), [linked regex](../examples/regex/linked), [multi-crate example](../examples/multi) |
+| Rust embedding Goose | [Embedding conformance](../conformance/embed), [example](../examples/embed) |
+| Typed builders, alignment, enums, optional parameters, generics and iterators | [Goose conformance programs](../conformance/rust/goose-tests) |
+| Direct re-entry and coroutine callbacks | `reentry.goose`, `callbacks.goose` and `zero_copy_reentry.goose` in the conformance suite |
+| Strict zero-copy exports | [Shim/allocation tests](../conformance/rust/tests/zero_copy.rs), compile-fail fixtures, binding checks and `zero_copy.goose` |
+| Package generation | [Package sources](../packages), `cargo goose package`, package-relative library mappings |
+| Scaffolding and test runner | `cargo goose new`, `cargo goose test`, [CLI tests](../crates/cargo-goose/tests) |
+| Boundary costs | [Recorded benchmark results](../bench/RESULTS.md); these predate strict exports |
 
 ## Where it has run
 
-| Platform | What ran | Result |
-|---|---|---|
-| macOS (Darwin 25.6), arm64 | `scripts/check.sh`: the Rust tests, the conformance suite both ways and the examples against both compilers, the original Cargo integration, two crates in one program, the packages with no Rust; Goose's own test suite with the series applied | passed |
-| Linux arm64, Ubuntu 24.04 (a Lima VM) | `scripts/check.sh` from a clean clone, both compilers built there, the packages (`lib/linux-arm64`) with no Rust | passed |
-| Linux x86_64 | nothing; the packages' libraries are built (`lib/linux-x86_64`) | not run |
-| macOS x86_64 | nothing; the universal library has the slice | not run |
-| Windows x86_64 | nothing; the packages' libraries are built (`lib/windows`) | not run |
-| CI ([ci.yml](../.github/workflows/ci.yml)) | written for all three platforms and a no-Rust job; the repository is not on GitHub | never run |
+Earlier platform results apply to the original compiler series and bridge.
+They do not validate later native-provider or strict-export changes.
+
+| Platform | Recorded coverage |
+|---|---|
+| macOS arm64 | Latest validation above. Earlier runs also covered the standard package examples without Rust on PATH. |
+| Linux arm64, Ubuntu 24.04 | Earlier compiler builds, conformance, examples and package examples passed. |
+| Linux x86_64 | Earlier package libraries built; no execution results recorded. |
+| macOS x86_64 | Earlier universal package libraries contain this architecture; no execution results recorded. |
+| Windows x86_64 | Earlier package libraries built; no execution results recorded. |
+| CI | [Workflow](../.github/workflows/ci.yml) defines Linux, macOS and Windows jobs, package builds and no-Rust checks. No CI results are recorded here. |

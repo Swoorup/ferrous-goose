@@ -1,113 +1,107 @@
-# The Goose patch series
+# Goose compiler patches
 
-The compiler changes in [goose-patches/](../goose-patches/) apply in order to
+The eight patches in [goose-patches/](../goose-patches/) apply in order to
 Goose commit `e76d5c9f7f0a17d83c12a405fbb2513094d03985`.
-`scripts/toolchain.sh` builds them into `.toolchain/goose/build/goose`;
-`--stock` builds the pinned compiler without the patches.
+`scripts/toolchain.sh` builds the result at `.toolchain/goose/build/goose`;
+`--stock` builds the pinned commit without patches.
 
-These patches describe a native interface usable from C, Rust or another
-language. The compiler contains no Cargo commands, Rust crate metadata or
-binding-project capability registry. Cargo integration remains in the Rust
-tooling, which implements the generic native-build provider protocol.
+They extend the native interface for C, Rust and other languages. Cargo
+commands and crate metadata stay in the Rust build provider.
 
-A compiler advertises capabilities separately from its native layout ABI:
+## Capabilities and ABI
 
-```
+```text
 goose runtime <runtime-hash>
 features: typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align reentrant
 native-abi: 1
 ```
 
-`features:` describes supported operations. `native-abi: 1` identifies the
-public native value layouts (slices, builder headers/references and stack
-control blocks); it does not promise that a compiler supports every optional
-operation. Runtime-hook structs carry their own version. A feature list by
-itself is not evidence of ABI compatibility.
+`features:` lists supported operations. `native-abi: 1` versions the public
+slice, builder and stack-control layouts. Runtime hooks have their own
+version. Feature support alone does not establish ABI compatibility.
 
-`cargo goose` and `goose_build` read the neutral feature line. Stock compilers
-still work through the existing fallbacks: vector results use a length/copy
-protocol; declarations requiring an unavailable feature are omitted with a
-comment. Older experimental compilers with only a `ferrous:` line should be
-rebuilt with `scripts/toolchain.sh`.
+`cargo goose` and `goose_build` read the feature list. Stock-compiler
+fallbacks include a length/copy protocol for vector results. Functions
+requiring unavailable features are omitted with a comment. Rebuild older
+experimental compilers that report only `ferrous:`.
 
-| Patch | Capability | General native-interface purpose |
+| Patch | Capability | Behavior |
 |---|---|---|
-| 0001 | `typed-builders` | Allow an extern to append whole flat, fixed-size elements to a `T[>..]&`; `gs_bld_push` counts elements. Also report compiler capabilities and native ABI. |
-| 0002 | `export-results` | Export multiple results using a return value and out-pointers. Export builders use runtime scratch storage borrowed until the next exported call. |
-| 0003 | `emit-interface` | Describe exports and reachable type layouts as JSON for binding generators and ABI checks. |
-| 0004 | `runtime-hooks` | Offer native libraries the program's abort behavior and end-of-program callbacks. |
-| 0005 | `native-build` | Run an external provider which supplies generated modules, a static library, linker arguments and optional hook/combiner metadata. |
-| 0006 | `package-dylibs` | Resolve package-relative prebuilt libraries, with platform and architecture overrides. |
-| 0007 | `align` | Keep declared structs/enums aligned in variables, arrays and data stacks. Enforce size, field-placement and supported-container constraints. |
-| 0008 | `reentrant` | Permit native code to call program exports while a native call is running, publishing stack tops and enforcing callback eligibility. |
+| 0001 | `typed-builders` | Native functions append flat, fixed-size elements to `T[>..]&`; `gs_bld_push` counts elements. Adds capability and ABI reporting. |
+| 0002 | `export-results` | Multiple results use a return value and output pointers. Exported builder parameters use runtime scratch storage. |
+| 0003 | `emit-interface` | JSON describes exports and reachable layouts for binding generation and verification. |
+| 0004 | `runtime-hooks` | Libraries receive Goose's abort behavior and end-of-program callbacks. |
+| 0005 | `native-build` | An external command supplies modules, an archive, linker arguments and optional initialization/combination commands. |
+| 0006 | `package-dylibs` | Packages resolve prebuilt libraries from their own directory, with platform and architecture overrides. |
+| 0007 | `align` | Structs and enums stay aligned in variables, arrays and data stacks; invalid layouts and containers are rejected. |
+| 0008 | `reentrant` | Native code calls back into exports after callers publish their stack tops. Runtime lookup checks callback eligibility. |
 
 ## External native builders
 
-For this repository's Rust provider, a sidecar is:
+A sidecar selects a provider with an argv list:
 
 ```goose
 native_build = ["cargo-goose", "native", "--manifest-path", "../rust/Cargo.toml"];
 ```
 
-The command is an argv list, run from the package root with no shell
-expansion. Goose appends these provider arguments:
+The command runs from the package directory, without shell expansion.
+Goose appends:
 
-- `--out-dir`: the absolute package root, where generated modules belong.
-- `--cache-dir`: a directory available for cached build products.
-- `--compiler`: the absolute Goose executable used for this compilation.
-- `--include-dir`: a directory containing the compiler's public `goose.h`.
+| Argument | Value |
+|---|---|
+| `--out-dir` | Absolute package directory for generated modules |
+| `--cache-dir` | Build-cache directory |
+| `--compiler` | Absolute path to the active Goose executable |
+| `--include-dir` | Directory containing its public `goose.h` |
 
-A provider prints a final report line after any build logs:
+The provider must exit successfully and print a final report line:
 
-```
+```text
 goose-native: {"version":1,"staticlib":"/abs/libnative.a","native_libs":["-lm"],"runtime_hooks":"native_init"}
 ```
 
-`staticlib` is required and must exist; relative paths are resolved from the
-provider's working directory. `native_libs` optionally contains linker
-arguments. `runtime_hooks` optionally names an initializer taking
-`const gs_rt_hooks *`. Goose links the archive for a native build, or builds
-a library around it for the JIT. The language server never runs providers.
+`staticlib` is required and must exist. Relative paths resolve from the
+provider's working directory. `native_libs` optionally lists linker
+arguments. `runtime_hooks` optionally names a public C initializer taking
+`const gs_rt_hooks *`. A native build links the archive; the JIT builds a
+shared library from it. The language server reads generated modules but
+does not run providers.
 
-A provider may also report `combine` (an argv command) and `combine_input`
-(an opaque string). When several packages name the same combiner, Goose
-invokes it with `--out-dir <cache>` and repeated `--input <opaque-string>`
-arguments. It returns the same versioned library report. The Rust provider
-uses this to build one umbrella crate, avoiding duplicate Rust runtime
-symbols; none of that interpretation lives in Goose.
+Providers that need to combine packages can also report `combine` (an argv
+list) and `combine_input` (an opaque string). Packages sharing a combiner
+command are grouped. Goose invokes that command with `--out-dir <cache>`
+and one `--input <string>` per package; it must return the same versioned
+library report. The Rust provider uses an umbrella crate to avoid duplicate
+Rust runtime symbols.
 
-`cargo_features` and `cargo_crate` are replaced by explicit arguments to the
-provider command. For example, append `"--features", "unicode"` to enable
-Cargo features. Put `cargo-goose` on PATH (`cargo install --path
-crates/cargo-goose`); a sidecar can instead name any provider executable by
-absolute path. See `scripts/check-native-build.py` for a plain C provider
-which exercises builders and hooks with no Rust on PATH.
+Install `cargo-goose` on PATH or use an absolute executable path. Cargo
+features are command arguments, for example `"--features", "unicode"`.
+These replace the former `cargo_crate` and `cargo_features` keys. A
+[plain C provider test](../scripts/check-native-build.py) exercises hooks,
+typed builders and JIT/native builds without Rust on PATH.
 
-## Layout and lifetime policies
+## Layout and lifetimes
 
-Alignment makes borrowing possible; it does not prove identical layouts or
-remove validity checks. In the current aligned-enum representation the tag
-occupies the alignment-sized prefix. This policy is retained for existing
-bindings; independently choosing tag width and payload alignment is a
-separate language-layout design, not implied by removing project coupling.
+Alignment and layout compatibility are separate checks. An aligned enum's
+tag uses an alignment-sized prefix before its payload. Rust bindings match
+that representation with explicit padding and fix the upper tag bytes
+after mutation.
 
-Export scratch builders remain valid until the next exported call. Rust
-bindings enforce that lifetime through a mutable runtime borrow. Other
-hosts must enforce it themselves.
+Exported scratch-builder contents remain valid until the next exported
+call. Rust wrappers enforce this with a mutable runtime borrow; other
+hosts must enforce the lifetime themselves.
 
-Reentrant exports must run on the program thread and may not access a
-mutable `var` global, including through callees. Rust closure-style callbacks
-use a separate coroutine implementation that works with stock Goose.
+Re-entry requires the program thread. Callback exports cannot access mutable
+`var` globals, including through callees. Closure callbacks use a separate
+coroutine protocol that works with stock Goose.
 
-The bridge's strict `#[goose::export(zero_copy)]` contract and current
-performance guarantees are explained in [performance.md](performance.md).
-The annotation uses these existing generic capabilities; it adds no
-project-specific compiler feature.
+Strict `#[goose::export(zero_copy)]` uses these capabilities without adding
+a compiler feature. Its [copy contract](performance.md) covers validation,
+failure behavior and packaging limits.
 
 ## Maintaining the series
 
-Reconstruct the pinned compiler, apply each patch in order and keep one
-commit per feature in an isolated development clone. Regenerate patches
-against the pinned commit after changes. After editing `src/runtime/`, run
-`build/goose --gen-runtime-header` and rebuild so `runtime_inline.h` matches
-the source runtime.
+Use an isolated clone of the pinned compiler with one commit per patch.
+Apply the series in order and regenerate patches against the pinned commit.
+After changing `src/runtime/`, run `build/goose --gen-runtime-header` and
+rebuild so `runtime_inline.h` matches the runtime sources.
