@@ -1,30 +1,24 @@
-From 9b93281670f7505620ccaf8f67bcfd85050540a8 Mon Sep 17 00:00:00 2001
-From: Ferrous Goose <ferrous@goose.invalid>
-Date: Sun, 25 Oct 2026 21:22:07 +1100
-Subject: [PATCH 8/8] Calls back into the program: reentrant externs (Ferrous
- Goose 0008)
+From 79364b2514cb7931b00fb72ca93802fa4c6b2ef7 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:28 +1100
+Subject: [PATCH] Support callbacks through reentrant native functions
 
-An extern declared reentrant may call the program's export fns back: its
-callers publish every cached stack top first, so a call back starts above
-all live data. The runtime's hooks (version 2) find an export fn by C symbol
-and signature, on the main program's thread, and only one that touches no
-var global.
 ---
  docs/goose_spec.md         |  19 ++++-
  src/ast.h                  |   6 ++
+ src/capabilities.h         |   2 +-
  src/codegen.h              |   1 +
- src/codegen_emit.h         |  70 +++++++++++++++++
- src/ferrous.h              |   2 +-
+ src/codegen_emit.h         |  69 +++++++++++++++++
  src/native.h               |   1 +
  src/parser.h               |   8 +-
  src/runtime/goose.h        |   5 ++
  src/runtime/runtime.h      |  15 ++++
  src/runtime/runtime_impl.h |  45 ++++++++++-
  src/runtime_inline.h       | 149 ++++++++++++++++++++++++++-----------
- 11 files changed, 269 insertions(+), 52 deletions(-)
+ 11 files changed, 268 insertions(+), 52 deletions(-)
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index 509c85b1..ac42bbff 100644
+index 161c62d3..a79dc2be 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
 @@ -2984,13 +2984,28 @@ cannot load SDL2 (libSDL2.so): libSDL2.so: cannot open shared object file: No su
@@ -59,14 +53,14 @@ index 509c85b1..ac42bbff 100644
  function cannot be bound: the declaration has no way to say so, and
  calling one through a fixed-arity pointer is undefined. The generated C is
 diff --git a/src/ast.h b/src/ast.h
-index 58bbc69e..b83ab634 100644
+index 79bc5090..8d5d1819 100644
 --- a/src/ast.h
 +++ b/src/ast.h
 @@ -1468,6 +1468,12 @@ struct SFunction {
      // (os.trim_memory): each caller, and transitively theirs, publishes all
      // of its cached tops before the call (CodeGen::CollectSpecs, SyncReach).
      bool readsalltops = false;
-+    // `reentrant` (Ferrous Goose 0008): the C behind it may call the
++    // `reentrant`: the C behind it may call the
 +    // program's export fns back while it runs. Its callers publish every
 +    // cached stack top first (readsalltops), so a call back starts above all
 +    // live data, a builder's elements included, and returns the stacks as
@@ -75,8 +69,18 @@ index 58bbc69e..b83ab634 100644
      bool isnested = false;
      SFunction *outer = nullptr;     // The function a nested one is declared in.
      Block *body = nullptr;
+diff --git a/src/capabilities.h b/src/capabilities.h
+index 1eaecbc4..c6cd844d 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
+ #pragma once
+ 
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align reentrant"
 diff --git a/src/codegen.h b/src/codegen.h
-index 9ad7e28e..f40b19ff 100644
+index 516feb68..1c4ff73a 100644
 --- a/src/codegen.h
 +++ b/src/codegen.h
 @@ -1429,6 +1429,7 @@ struct CodeGen {
@@ -88,27 +92,26 @@ index 9ad7e28e..f40b19ff 100644
      void EmitMain();
  
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 50d4aac9..8436d882 100644
+index 4fa98cd6..d5a3e385 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
-@@ -909,6 +909,9 @@ inline void CodeGen::EmitProgramInit() {
-         Append(data, "void goose_runtime_hooks(const gs_rt_hooks *);\n");
-         Append(code, "    gs_rt_give_hooks(goose_runtime_hooks);\n");
+@@ -910,6 +910,8 @@ inline void CodeGen::EmitProgramInit() {
+         Append(data, "void ", hook, "(const gs_rt_hooks *);\n");
+         Append(code, "    gs_rt_give_hooks(", hook, ");\n");
      }
-+    // The export fns C may call back (0008), before any library runs.
 +    Append(data, "static void gs_register_reentry(void);\n");
 +    Append(code, "    gs_register_reentry();\n");
      // The queues, before anything that could use one runs.
      vector<string> qnames;
      for (auto &[m, q] : queues) qnames.push_back(q);
-@@ -1071,6 +1074,73 @@ inline void CodeGen::EmitExports() {
+@@ -1072,6 +1074,73 @@ inline void CodeGen::EmitExports() {
          }
          Append(code, "}\n\n");
      }
 +    EmitReentryTable();
 +}
 +
-+// The table a call back from C finds export fns in (Ferrous Goose 0008):
++// The table a call back from C finds export fns in:
 +// each one's C symbol, its signature as Goose writes it, its wrapper, and
 +// whether a call back may reach it: one that touches no `var` global, so
 +// that the code it interrupts, which assumed an extern leaves the globals
@@ -175,18 +178,8 @@ index 50d4aac9..8436d882 100644
  }
  
  inline string CodeGen::ExportHeader() {
-diff --git a/src/ferrous.h b/src/ferrous.h
-index f0fd8cf2..b438d024 100644
---- a/src/ferrous.h
-+++ b/src/ferrous.h
-@@ -3,4 +3,4 @@
- // lists so that cargo goose and goose_build know what the compiler can do.
- #pragma once
- 
--#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs align"
-+#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs align reentrant"
 diff --git a/src/native.h b/src/native.h
-index b3fec023..a1ea6e8c 100644
+index 579aec10..685b060e 100644
 --- a/src/native.h
 +++ b/src/native.h
 @@ -89,6 +89,7 @@ inline void ExternNamesIn(const string &path, const string &text, set<string> &n
@@ -198,7 +191,7 @@ index b3fec023..a1ea6e8c 100644
          lex.Next();
          if (lex.tok == T_IDENT) {
 diff --git a/src/parser.h b/src/parser.h
-index 2e150dde..08225384 100644
+index 148d1714..1692aa06 100644
 --- a/src/parser.h
 +++ b/src/parser.h
 @@ -774,6 +774,12 @@ struct Parser {
@@ -240,14 +233,14 @@ index 2ae6bd69..637fee90 100644
  
  /* Appends `count` elements of `size` bytes each to the T[>..] a typed
 diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
-index 6c1c118d..8133ed9c 100644
+index 6ae936a5..4bd09c4f 100644
 --- a/src/runtime/runtime.h
 +++ b/src/runtime/runtime.h
 @@ -190,7 +190,22 @@ typedef struct {
      uint32_t version;
      void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
      void (*at_end)(void (*fn)(void));
-+    /* Version 2 (Ferrous Goose 0008): the wrapper of the export fn `name`
++    /* Version 2: the wrapper of the export fn `name`
 +       whose signature is `sig`, for C a reentrant extern runs to call back;
 +       NULL, with *why saying why, where there is none it may call. And
 +       whether the calling thread runs the main program, whose stacks the
@@ -267,7 +260,7 @@ index 6c1c118d..8133ed9c 100644
  GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *));
  GS_API void gs_rt_end_hooks(void);
 diff --git a/src/runtime/runtime_impl.h b/src/runtime/runtime_impl.h
-index 2fe9ecd5..b27329b5 100644
+index 2fe9ecd5..0a4b997f 100644
 --- a/src/runtime/runtime_impl.h
 +++ b/src/runtime/runtime_impl.h
 @@ -128,11 +128,40 @@ GS_API void gs_rt_end_hooks(void) {
@@ -320,7 +313,7 @@ index 2fe9ecd5..b27329b5 100644
  static GS_TLS int64_t gs_current_thread_id = -1;
 +
 +/* Whether the calling thread runs the main program, whose stacks the export
-+   wrappers use (gs_rt_hooks, Ferrous Goose 0008). */
++   wrappers use (gs_rt_hooks). */
 +static int gs_on_program_thread(void) { return gs_current_thread_id < 0; }
 +
 +GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *)) {
@@ -332,14 +325,14 @@ index 2fe9ecd5..b27329b5 100644
     main program and any one worker can hold, as gs_rt_start was told, and
     the workers that leaves room for: what hardware_threads() reports at
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index 883a159d..ad4d5b31 100644
+index 87a69a04..9d69273c 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
 @@ -203,7 +203,22 @@ typedef struct {
      uint32_t version;
      void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
      void (*at_end)(void (*fn)(void));
-+    /* Version 2 (Ferrous Goose 0008): the wrapper of the export fn `name`
++    /* Version 2: the wrapper of the export fn `name`
 +       whose signature is `sig`, for C a reentrant extern runs to call back;
 +       NULL, with *why saying why, where there is none it may call. And
 +       whether the calling thread runs the main program, whose stacks the
@@ -418,16 +411,16 @@ index 883a159d..ad4d5b31 100644
      if (d - rem < ((uint64_t)1 << k)) {
          *more = (uint8_t)k;
      } else {
-@@ -873,7 +888,8 @@ GS_API void gs_release_regions(void);
- 
+@@ -874,7 +889,8 @@ GS_API void gs_release_regions(void);
  /* ---------------------------------------------------------------------------
     Dynamic externs (§7.10): the shared libraries the program's extern blocks
--   name, and the functions it calls through them, bound by name as the
+    name, and the functions it calls through them, bound by name as the
+-   program starts (docs/design/dynamic_externs.md). */
 +)GSRT"
-+R"GSRT(   name, and the functions it calls through them, bound by name as the
-    program starts (docs/design/dynamic_externs.md). */
++R"GSRT(   program starts (docs/design/dynamic_externs.md). */
  
  /* A library: the name its block gives and, where the sidecar spells it for
+    a platform, that spelling; NULL where the platform derives its own
 @@ -890,8 +906,7 @@ typedef struct gs_dlbind {
      void **slot;
  } gs_dlbind;
@@ -438,16 +431,16 @@ index 883a159d..ad4d5b31 100644
     does not have, is a runtime error naming both. */
  GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *binds,
                         int64_t nbinds);
-@@ -1059,7 +1074,8 @@ static int64_t gs_uleb_size(const uint8_t *p) {
-    walk, against which the call costs nothing. Both read the pointer twice,
+@@ -1060,7 +1075,8 @@ static int64_t gs_uleb_size(const uint8_t *p) {
     which the emitting sites already assume (they form the element address
     from the same text). A varint *value*, by contrast, is whatever the
--   program stored, so scalar fields and relative offsets keep the loop above
+    program stored, so scalar fields and relative offsets keep the loop above
+-   inline, where the compilers peel the first byte themselves. */
 +)GSRT"
-+R"GSRT(   program stored, so scalar fields and relative offsets keep the loop above
-    inline, where the compilers peel the first byte themselves. */
++R"GSRT(   inline, where the compilers peel the first byte themselves. */
  
  static GS_NOINLINE int64_t gs_uleb_read_slow(const uint8_t *p) {
+     return gs_uleb_read(p);
 @@ -1083,8 +1099,7 @@ static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
      return (int64_t)(q - p);
  }
@@ -471,8 +464,8 @@ index 883a159d..ad4d5b31 100644
 +GS_API void gs_rt_set_reentry(const gs_reentry_entry *table, int64_t n) {
 +    gs_reentry_tab = table;
 +    gs_reentry_n = n;
-+}
-+
+ }
+ 
 +/* Called from C on the main program's thread only (gs_on_program_thread),
 +   so one buffer serves the reasons. */
 +static void *gs_reentry_lookup(const char *name, const char *sig, const char **why) {
@@ -496,8 +489,8 @@ index 883a159d..ad4d5b31 100644
 +    snprintf(reason, sizeof reason, "the program has no export fn %s", name);
 +    if (why) *why = reason;
 +    return NULL;
- }
- 
++}
++
 +
  GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line) {
      gs_failf(file, line, "index %lld out of bounds (length %lld)", (long long)i, (long long)n);
@@ -524,7 +517,7 @@ index 883a159d..ad4d5b31 100644
  static GS_TLS int64_t gs_current_thread_id = -1;
 +
 +/* Whether the calling thread runs the main program, whose stacks the export
-+   wrappers use (gs_rt_hooks, Ferrous Goose 0008). */
++   wrappers use (gs_rt_hooks). */
 +static int gs_on_program_thread(void) { return gs_current_thread_id < 0; }
 +
 +GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *)) {
@@ -535,16 +528,16 @@ index 883a159d..ad4d5b31 100644
  /* The program's address space budget for regions and the most regions its
     main program and any one worker can hold, as gs_rt_start was told, and
     the workers that leaves room for: what hardware_threads() reports at
-@@ -1536,7 +1590,8 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
-                 static const char nomem[] =
+@@ -1537,7 +1591,8 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
                      "goose runtime error: out of memory committing a data stack\n";
                  DWORD written;
--                WriteFile(GetStdHandle(STD_ERROR_HANDLE), nomem, sizeof(nomem) - 1, &written,
+                 WriteFile(GetStdHandle(STD_ERROR_HANDLE), nomem, sizeof(nomem) - 1, &written,
+-                          NULL);
 +)GSRT"
-+R"GSRT(                WriteFile(GetStdHandle(STD_ERROR_HANDLE), nomem, sizeof(nomem) - 1, &written,
-                           NULL);
++R"GSRT(                          NULL);
                  ExitProcess(1);
              }
+             char msg[GS_OVERFLOW_TEXT];
 @@ -1580,8 +1635,7 @@ static void gs_native_stack_init(void) {
  static void gs_native_stack_free(void) {}
  
@@ -555,16 +548,16 @@ index 883a159d..ad4d5b31 100644
  static uint8_t *gs_os_reserve(size_t usable, size_t size) {
      (void)usable;
      return (uint8_t *)VirtualAlloc(0, size, MEM_RESERVE, PAGE_READWRITE);
-@@ -1737,7 +1791,8 @@ static void gs_native_stack_init(void) {
-         pthread_attr_t attr;
+@@ -1738,7 +1792,8 @@ static void gs_native_stack_init(void) {
          void *base;
          size_t size;
--        if (!pthread_getattr_np(pthread_self(), &attr)) {
+         if (!pthread_getattr_np(pthread_self(), &attr)) {
+-            if (!pthread_attr_getstack(&attr, &base, &size)) {
 +)GSRT"
-+R"GSRT(        if (!pthread_getattr_np(pthread_self(), &attr)) {
-             if (!pthread_attr_getstack(&attr, &base, &size)) {
++R"GSRT(            if (!pthread_attr_getstack(&attr, &base, &size)) {
                  lo = (uintptr_t)base;
                  hi = lo + size;
+             }
 @@ -1779,8 +1834,7 @@ static uint8_t *gs_os_reserve(size_t usable, size_t size) {
      void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS
@@ -575,16 +568,16 @@ index 883a159d..ad4d5b31 100644
                     #endif
                     , -1, 0);
      if (p == MAP_FAILED) return NULL;
-@@ -1931,7 +1985,8 @@ GS_API uint8_t gs_trim_memory(void) {
-         }
+@@ -1932,7 +1986,8 @@ GS_API uint8_t gs_trim_memory(void) {
  #else
          /* Linux walks only the page tables that were ever populated, so the
--           untouched rest of the reservation costs it little. */
+            untouched rest of the reservation costs it little. */
+-        if (madvise((void *)start, len, MADV_DONTNEED)) ok = 0;
 +)GSRT"
-+R"GSRT(           untouched rest of the reservation costs it little. */
-         if (madvise((void *)start, len, MADV_DONTNEED)) ok = 0;
++R"GSRT(        if (madvise((void *)start, len, MADV_DONTNEED)) ok = 0;
  #endif
      }
+     return (uint8_t)ok;
 @@ -1961,8 +2016,7 @@ GS_API uint8_t gs_trim_memory(void) {
     of the one before: no freelist gets this deep. */
  #define GS_SPAN_DEPTH 24
@@ -595,16 +588,16 @@ index 883a159d..ad4d5b31 100644
  typedef struct { int64_t n, link, idx[GS_SPAN_LEAF], cnt[GS_SPAN_LEAF]; } gs_spleaf;
  typedef struct { int64_t n, link, key[GS_SPAN_FAN], max[GS_SPAN_FAN], child[GS_SPAN_FAN]; } gs_spinner;
  typedef struct { int64_t root, height, chain; } gs_sphead;
-@@ -2148,7 +2202,8 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
-             return;
-         }
+@@ -2150,7 +2204,8 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
          /* The node keeps its place above, and its new right half goes
--           after it. */
-+)GSRT"
-+R"GSRT(           after it. */
+            after it. */
          gs_sp_fix(p, l, INT64_MAX, 0);
-         child = nn;
+-        child = nn;
++)GSRT"
++R"GSRT(        child = nn;
          leaf = 0;
+         k = p->pos[l - 1] + 1;
+         l--;
 @@ -2200,8 +2255,7 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
      }
      gs_sp_dropnode(p, p->node[p->h]);
@@ -615,16 +608,16 @@ index 883a159d..ad4d5b31 100644
          int64_t e = p->pos[l], m = in->max[e];
          gs_sp_closein(in, e);
          if (in->n > 0) {
-@@ -2379,7 +2433,8 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt)
-         lf->cnt[k] = m;
+@@ -2380,7 +2434,8 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt)
          /* The merged count is larger than both it replaces, so one fix
             covers the span after leaving the leaf as well. */
--        if (next && nl == lf) gs_sp_close(lf, nk);
+         if (next && nl == lf) gs_sp_close(lf, nk);
+-        gs_sp_fix(p, p->h, c, m);
 +)GSRT"
-+R"GSRT(        if (next && nl == lf) gs_sp_close(lf, nk);
-         gs_sp_fix(p, p->h, c, m);
++R"GSRT(        gs_sp_fix(p, p->h, c, m);
          if (next && nl != lf) gs_sp_delete(s->np, nk);
      } else if (next) {
+         int64_t c = nl->cnt[nk];
 @@ -2424,8 +2479,7 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
      gs_sppath p, q;
      gs_spnear s;
@@ -635,16 +628,16 @@ index 883a159d..ad4d5b31 100644
          gs_spans_free(base, n, top, idx, ol);
          return gs_spans_alloc(base, n, top, len, cnt);
      }
-@@ -2585,7 +2639,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
-    finds in a block. */
+@@ -2586,7 +2640,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
  #define GS_ANY_LOOP(TEST)                                                              \
      int64_t i = 0;                                                                     \
--    unsigned k;                                                                        \
+     unsigned k;                                                                        \
+-    for (; i + 16 <= n; i += 16) {                                                     \
 +)GSRT"
-+R"GSRT(    unsigned k;                                                                        \
-     for (; i + 16 <= n; i += 16) {                                                     \
++R"GSRT(    for (; i + 16 <= n; i += 16) {                                                     \
          k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + i)));                         \
          if (k) return i + gs_ctz32(k);                                                 \
+     }                                                                                  \
 @@ -2605,8 +2660,7 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
      }                                                                                  \
      if (i == np) return -1;                                                            \
@@ -655,16 +648,16 @@ index 883a159d..ad4d5b31 100644
          >> (16 - (np - i));                                                            \
      return k ? i + gs_ctz32(k) : -1;
  
-@@ -2752,7 +2806,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
- /* Integers are written by a digit loop rather than printf, whose locale
-    handling and format parsing cost several times the conversion itself:
+@@ -2754,7 +2808,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
     the digit count first, then the digits from the right, two per division
--   by 100. */
-+)GSRT"
-+R"GSRT(   by 100. */
+    by 100. */
  static const char gs_digit_pairs[201] =
-     "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+-    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
++)GSRT"
++R"GSRT(    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
      "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+     "8081828384858687888990919293949596979899";
+ 
 @@ -2800,8 +2855,7 @@ GS_API int64_t gs_fmt_i64(uint8_t *dst, int64_t v) {
     same value of its own type and, of those, the ones nearest it, a tie going
     to the even digit (as Python's repr and Ryu choose). They are found in
@@ -675,16 +668,16 @@ index 883a159d..ad4d5b31 100644
     zero, and below a power of two the gap to the next float is half the gap
     above, so the shortest text can lie above the value while the correctly
     rounded spelling of that length, below it, does not read back.
-@@ -2972,7 +3026,8 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int
-         for (i = 0; i < n || i <= x; i++) {
+@@ -2973,7 +3027,8 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int
              if (i == x + 1) *p++ = '.';
              *p++ = i < n ? dig[i] : '0';
--        }
+         }
+-        /* A whole number still reads as a float: 1.0, not 1. */
 +)GSRT"
-+R"GSRT(        }
-         /* A whole number still reads as a float: 1.0, not 1. */
++R"GSRT(        /* A whole number still reads as a float: 1.0, not 1. */
          if (n <= x + 1) {
              *p++ = '.';
+             *p++ = '0';
 @@ -3019,8 +3074,7 @@ GS_API int64_t gs_fmt_quoted(uint8_t *dst, const uint8_t *s, int64_t n) {
      for (int64_t i = 0; i < n; i++) {
          uint8_t c = s[i];
@@ -707,6 +700,3 @@ index 883a159d..ad4d5b31 100644
  } gs_rt_hooks;
  
  /* Appends `count` elements of `size` bytes each to the T[>..] a typed
--- 
-2.54.0
-

@@ -45,7 +45,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-# cdylib: what goose run opens; staticlib: what a cargo_crate build links.
+# cdylib: what goose run opens; staticlib: what a native provider build links.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]

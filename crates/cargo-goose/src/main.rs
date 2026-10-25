@@ -16,8 +16,8 @@ commands:
   test                run the crate's Goose test programs (goose-tests/*.goose)
   new <path>          a crate with the attributes in place and a Goose example
   package <dir>       a Goose package: the module and prebuilt libraries
-  native              build for a cargo_crate sidecar key (the patched goose calls it)
-  combine             one static library for several crates (the patched goose calls it)
+  native              native-build provider: build a crate and write its module
+  combine             native-build combiner: one static library for several crates
   help                this text
 
 options:
@@ -52,6 +52,7 @@ struct Args {
     namespace: Option<String>,
     targets: Vec<String>,
     target_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
     goose_path: Option<PathBuf>,
     zig: bool,
     no_verify: bool,
@@ -81,7 +82,7 @@ fn parse_args() -> Result<Args, String> {
             "--static" => a.static_link = true,
             "--typed-builders" => a.typed = Some(true),
             "--no-typed-builders" => a.typed = Some(false),
-            "--goose" => a.goose = Some(val("--goose")?),
+            "--goose" | "--compiler" => a.goose = Some(val("--goose")?),
             "--allow-runtime" => a.allow_runtime = Some(val("--allow-runtime")?),
             "--namespace" => a.namespace = Some(val("--namespace")?),
             "--target" | "--targets" => a.targets.extend(val("--target")?.split(',').map(String::from)),
@@ -89,7 +90,12 @@ fn parse_args() -> Result<Args, String> {
             "--goose-crate-path" => a.goose_path = Some(PathBuf::from(val("--goose-crate-path")?)),
             "--zig" => a.zig = true,
             "--no-verify" => a.no_verify = true,
-            "--crate" => a.crates.push(val("--crate")?),
+            "--include-dir" => {
+                // The Rust provider uses its own ABI declarations; C providers use this header.
+                val("--include-dir")?;
+            }
+            "--cache-dir" => a.cache_dir = Some(PathBuf::from(val("--cache-dir")?)),
+            "--crate" | "--input" => a.crates.push(val("--input")?),
             "-h" | "--help" => a.cmd = "help".into(),
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             _ => a.positional.push(x),
@@ -217,7 +223,7 @@ fn cmd_build_run(a: &Args, run: bool) -> Result<u8, String> {
 /// exits with an error whose stderr holds every line of it. A first-line
 /// comment `// test: build` builds an executable rather than running in the
 /// compiler (threads need one); `// test: needs <feature>` skips the test on
-/// a compiler without that Ferrous Goose patch.
+/// a compiler without that capability.
 fn cmd_test(a: &Args) -> Result<u8, String> {
     let (goose, info, opts) = gen_options(a, gen::Link::Dynamic(String::new()))?;
     let b = cargo_goose::bindings(a.manifest.as_deref(), a.lib.as_deref(), &build_opts(a), &opts)?;
@@ -368,14 +374,17 @@ fn cmd_package(a: &Args) -> Result<u8, String> {
     Ok(0)
 }
 
-/// For a `cargo_crate` sidecar key (goose-patches/0005): builds the crate's
+/// A native-build provider (goose-patches/0005): builds the crate's
 /// static and shared libraries, writes the module for linking, and prints
 /// what the compiler needs as JSON.
 fn cmd_native(a: &Args) -> Result<u8, String> {
     let out_dir = a.out.clone().ok_or("native needs --out-dir")?;
     let (_, info, mut opts) = gen_options(a, gen::Link::Static)?;
     opts.link = gen::Link::Static;
-    let bo = build_opts(a);
+    let mut bo = build_opts(a);
+    if bo.target_dir.is_none() {
+        bo.target_dir = a.cache_dir.clone();
+    }
     let b = cargo_goose::bindings(a.manifest.as_deref(), None, &bo, &opts)?;
     check_versions(a, &info, &b)?;
     let module = out_dir.join(format!("{}.goose", b.library.namespace));
@@ -389,6 +398,10 @@ fn cmd_native(a: &Args) -> Result<u8, String> {
     }
     let libs = toolchain::native_static_libs(&b.crate_info, &bo);
     let j = serde_json::json!({
+        "version": 1,
+        "runtime_hooks": "goose_runtime_hooks",
+        "combine": [std::env::current_exe().map_err(|e| format!("cannot locate cargo-goose: {e}"))?, "combine"],
+        "combine_input": serde_json::json!({"manifest": b.crate_info.manifest, "features": bo.features}).to_string(),
         "namespace": b.library.namespace,
         "module": module,
         "staticlib": staticlib,
@@ -399,7 +412,7 @@ fn cmd_native(a: &Args) -> Result<u8, String> {
     Ok(0)
 }
 
-/// For several `cargo_crate` keys in one program (goose-patches/0005): an
+/// The native-build combiner for Rust libraries (goose-patches/0005): an
 /// umbrella crate depending on each (`--crate dir[:feature,...]`), built as
 /// one static library, since two Rust static libraries would each define
 /// Rust's own symbols. Prints what the compiler needs as JSON.
@@ -411,15 +424,25 @@ fn cmd_combine(a: &Args) -> Result<u8, String> {
     let mut deps = String::new();
     let mut uses = String::new();
     for (i, c) in a.crates.iter().enumerate() {
-        let (dir, features) = match c.split_once(':') {
-            Some((d, f)) if !d.is_empty() && !f.contains('/') && !f.contains('\\') => (d.to_string(), f.to_string()),
-            _ => (c.clone(), String::new()),
+        let (manifest, features) = if c.starts_with('{') {
+            let input: serde_json::Value = serde_json::from_str(c).map_err(|e| format!("invalid combine input: {e}"))?;
+            let manifest = input["manifest"].as_str().ok_or("combine input needs a manifest")?;
+            let features = input["features"].as_array().ok_or("combine input needs a features list")?
+                .iter().map(|v| v.as_str().map(String::from).ok_or("combine features must be strings"))
+                .collect::<Result<Vec<_>, _>>()?;
+            (PathBuf::from(manifest), features)
+        } else {
+            let (dir, features) = match c.split_once(':') {
+                Some((d, f)) if !d.is_empty() && !f.contains('/') && !f.contains('\\') => (d.to_string(), f.to_string()),
+                _ => (c.clone(), String::new()),
+            };
+            (Path::new(&dir).join("Cargo.toml"), features.split(',').filter(|f| !f.is_empty()).map(String::from).collect())
         };
-        let ci = toolchain::crate_info(Some(&Path::new(&dir).join("Cargo.toml")))?;
+        let ci = toolchain::crate_info(Some(&manifest))?;
         if !ci.crate_types.iter().any(|t| t == "rlib" || t == "lib") {
             return Err(format!("{}: add \"rlib\" to the crate-type, so the program's crates can link as one library", ci.manifest.display()));
         }
-        let feats: Vec<String> = features.split(',').filter(|f| !f.is_empty()).map(|f| format!("{f:?}")).collect();
+        let feats: Vec<String> = features.iter().map(|f| format!("{f:?}")).collect();
         deps.push_str(&format!(
             "c{i} = {{ package = {:?}, path = {:?}, features = [{}] }}\n",
             ci.name,
@@ -439,7 +462,7 @@ fn cmd_combine(a: &Args) -> Result<u8, String> {
     toolchain::cargo_build(&ci, &bo)?;
     let staticlib = toolchain::staticlib_path(&ci, &bo);
     let libs = toolchain::native_static_libs(&ci, &bo);
-    let j = serde_json::json!({ "staticlib": staticlib, "native_libs": libs });
+    let j = serde_json::json!({ "version": 1, "staticlib": staticlib, "native_libs": libs, "runtime_hooks": "goose_runtime_hooks" });
     println!("goose-native: {j}");
     Ok(0)
 }

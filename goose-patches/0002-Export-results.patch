@@ -1,18 +1,13 @@
-From e225cba01ec8898f0f38b84fb620958b56e35b8a Mon Sep 17 00:00:00 2001
-From: Ferrous Goose <ferrous@goose.invalid>
-Date: Sun, 25 Oct 2026 19:30:14 +1100
-Subject: [PATCH 2/8] Export fns with several results and builder parameters
- (Ferrous Goose 0002)
+From aa1ae75d8febfe5993141022c1e5ec94dd387a95 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:22 +1100
+Subject: [PATCH] Support multiple export results and output builders
 
-The first result is C's return value and each further one an out-pointer;
-a builder parameter is a scratch builder the runtime keeps per parameter,
-whose elements and count the wrapper hands back, valid until the next
-exported call.
 ---
  docs/goose_spec.md    |  24 +++++--
+ src/capabilities.h    |   2 +-
  src/codegen.h         |   1 +
  src/codegen_emit.h    | 144 +++++++++++++++++++++++++++++++++++-------
- src/ferrous.h         |   2 +-
  src/typecheck.h       |   6 +-
  src/typecheck_calls.h |  14 ++--
  6 files changed, 150 insertions(+), 41 deletions(-)
@@ -57,6 +52,16 @@ index 659ba347..b114899a 100644
  
  Generated C retains its normal `main` unless the program is compiled with
  `--header out.h`, which builds it for a C host: the generated C has no `main`
+diff --git a/src/capabilities.h b/src/capabilities.h
+index 30575035..0e629230 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
+ #pragma once
+ 
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders"
++#define GOOSE_FEATURES "typed-builders export-results"
 diff --git a/src/codegen.h b/src/codegen.h
 index 14dd29d0..26dd84eb 100644
 --- a/src/codegen.h
@@ -248,16 +253,6 @@ index 3ccfe5ec..26773948 100644
          }
          Append(code, "}\n\n");
      }
-diff --git a/src/ferrous.h b/src/ferrous.h
-index 027d5caf..8ed6a6ff 100644
---- a/src/ferrous.h
-+++ b/src/ferrous.h
-@@ -3,4 +3,4 @@
- // lists so that cargo goose and goose_build know what the compiler can do.
- #pragma once
- 
--#define FERROUS_FEATURES "typed-builders"
-+#define FERROUS_FEATURES "typed-builders export-results"
 diff --git a/src/typecheck.h b/src/typecheck.h
 index f13bb5a4..52dc8dd9 100644
 --- a/src/typecheck.h
@@ -312,6 +307,3 @@ index 274a23a2..c25f421b 100644
      for (auto t : spec->rets) {
          ValidateType(t, sf->line, VT_LOCAL);
          if (t->kind == TY_SLICE && IsU8(t->sub)) {
--- 
-2.54.0
-

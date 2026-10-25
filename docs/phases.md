@@ -18,7 +18,7 @@ column says where it has run.
 
 | Promise | Where | Tested |
 |---|---|---|
-| `cargo_crate` and `cargo_features` sidecar keys: `goose build` links a staticlib, `goose run` builds and loads a library | goose-patches/0005, `cargo goose native` | `examples/regex/linked` (run and build) |
+| `native_build` provider command: `goose build` links a staticlib, `goose run` builds and loads a library | goose-patches/0005, `cargo goose native` | `examples/regex/linked` (run and build) |
 | Several crates in one program, linked as one static library | goose-patches/0005, `cargo goose combine` | `examples/multi` (run and build) |
 | Typed builders, `T[>..]&` of flat T | goose-patches/0001, `goose::GooseVec` | `typed_builders.goose`, `vecs.goose` |
 | Richer exports: several results, builders with a runtime scratch builder | goose-patches/0002, `goose_build` | `conformance/embed` (full) |
@@ -59,11 +59,18 @@ runs it on Windows, macOS and Linux. Met on macOS and Linux (arm64):
 PATH=/usr/bin:/bin`, after checking that no cargo or rustc is on it. Not met
 on Windows: the libraries are built for it, but nothing has run there.
 
+The platform history below describes the original series. The generic
+native-build protocol was validated on macOS arm64 on 2026-10-26:
+workspace tests, both conformance directions, C and Rust native providers
+(JIT and native executables), multi-crate combination and Goose's baseline
+suite passed. Package distribution was not rebuilt, and the generic
+protocol has not been exercised on Linux or Windows.
+
 ## Where it has run
 
 | Platform | What ran | Result |
 |---|---|---|
-| macOS (Darwin 25.6), arm64 | `scripts/check.sh`: the Rust tests, the conformance suite both ways and the examples against both compilers, `cargo_crate`, two crates in one program, the packages with no Rust; Goose's own test suite with the series applied | passed |
+| macOS (Darwin 25.6), arm64 | `scripts/check.sh`: the Rust tests, the conformance suite both ways and the examples against both compilers, the original Cargo integration, two crates in one program, the packages with no Rust; Goose's own test suite with the series applied | passed |
 | Linux arm64, Ubuntu 24.04 (a Lima VM) | `scripts/check.sh` from a clean clone, both compilers built there, the packages (`lib/linux-arm64`) with no Rust | passed |
 | Linux x86_64 | nothing; the packages' libraries are built (`lib/linux-x86_64`) | not run |
 | macOS x86_64 | nothing; the universal library has the slice | not run |

@@ -1,22 +1,18 @@
-From 6b9dc83136f091a6c7be4cd24ad265507c40c315 Mon Sep 17 00:00:00 2001
-From: Ferrous Goose <ferrous@goose.invalid>
-Date: Sun, 25 Oct 2026 19:23:18 +1100
-Subject: [PATCH 1/8] Typed builders at the extern boundary (Ferrous Goose
- 0001)
+From 23fad88c91e715301ae554c3b254d6bcde086f38 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:21 +1100
+Subject: [PATCH] Allow typed builders in the native interface
 
-An extern fn may take T[>..]& of any flat fixed-size T: C appends whole
-elements at the stack's top and counts them in the header (gs_bld_push in
-goose.h). goose version lists the Ferrous Goose patches it carries.
 ---
  docs/goose_spec.md    |  5 ++++-
- src/ferrous.h         |  6 ++++++
+ src/capabilities.h    |  5 +++++
  src/main.cpp          |  2 ++
  src/runtime/goose.h   | 14 +++++++++++++-
  src/runtime_inline.h  | 14 +++++++++++++-
  src/typecheck_calls.h | 16 +++++++++++++---
  test/run_tests.py     |  4 +++-
- 7 files changed, 54 insertions(+), 7 deletions(-)
- create mode 100644 src/ferrous.h
+ 7 files changed, 53 insertions(+), 7 deletions(-)
+ create mode 100644 src/capabilities.h
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
 index eb67619f..659ba347 100644
@@ -34,27 +30,26 @@ index eb67619f..659ba347 100644
  Returns are one scalar or flat fixed-size value by value, or nothing;
  references, slices and builders are parameter-only forms. Everything
  else — varints, references inside structs, variable and resizable values
-diff --git a/src/ferrous.h b/src/ferrous.h
+diff --git a/src/capabilities.h b/src/capabilities.h
 new file mode 100644
-index 00000000..027d5caf
+index 00000000..30575035
 --- /dev/null
-+++ b/src/ferrous.h
-@@ -0,0 +1,6 @@
-+// Goose compiler — the Ferrous Goose patches this compiler carries
-+// (github.com/goose-rs/ferrous-goose, goose-patches/), which `goose version`
-+// lists so that cargo goose and goose_build know what the compiler can do.
++++ b/src/capabilities.h
+@@ -0,0 +1,5 @@
++// Native interface capabilities reported by `goose version`.
 +#pragma once
 +
-+#define FERROUS_FEATURES "typed-builders"
++#define GOOSE_NATIVE_ABI 1
++#define GOOSE_FEATURES "typed-builders"
 diff --git a/src/main.cpp b/src/main.cpp
-index b143c3fb..8d5ae6d1 100644
+index b143c3fb..0c3f9b92 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -39,6 +39,7 @@
  #include "codegen_stacks.h"
  #include "codegen_nodes.h"
  #include "runtime_inline.h"
-+#include "ferrous.h"
++#include "capabilities.h"
  #include "process.h"
  #include "jit.h"
  #include "progress.h"
@@ -62,7 +57,7 @@ index b143c3fb..8d5ae6d1 100644
      }
      if (verb == "version") {
          printf("goose runtime %s\n", RuntimeVersion().c_str());
-+        printf("ferrous: %s\n", FERROUS_FEATURES);
++        printf("features: %s\nnative-abi: %d\n", GOOSE_FEATURES, GOOSE_NATIVE_ABI);
          return 0;
      }
      if (verb == "lsp") return RunLsp(exe, vector<string>(argv + firstarg, argv + argc));
@@ -164,21 +159,18 @@ index 4c58d0ca..274a23a2 100644
      if (spec->rets.size() > 1) fail("returns at most one value");
      if (!sf->has_rets && !spec->rets.empty())
 diff --git a/test/run_tests.py b/test/run_tests.py
-index 76eadb22..9343291b 100755
+index 76eadb22..dfabb947 100755
 --- a/test/run_tests.py
 +++ b/test/run_tests.py
 @@ -1923,8 +1923,10 @@ def main():
          code, out, err = tc.run_capture([exe, "run", "-o", str(gendir / "verbs.c"), probe])
          checks.append(("run -o (refused)", code != 0 and "takes no -o" in err, out + err))
          code, out, err = tc.run_capture([exe, "version"])
-+        # A compiler with Ferrous Goose's patches lists them on a second line.
++        # Native interface capabilities and ABI are reported after the runtime hash.
          checks.append(("version", code == 0 and
 -                       re.match(r"goose runtime [0-9a-f]{12}\s*$", out) is not None, out + err))
-+                       re.match(r"goose runtime [0-9a-f]{12}\n(ferrous: [a-z -]+\n)?\s*$", out) is not None,
++                       re.match(r"goose runtime [0-9a-f]{12}\n(features: [a-z -]+\nnative-abi: [0-9]+\n)?\s*$", out) is not None,
 +                       out + err))
          # Less than a page or two of data stack is no reservation to run on.
          code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
          checks.append(("check --stack-reserve 5000 (refused)",
--- 
-2.54.0
-

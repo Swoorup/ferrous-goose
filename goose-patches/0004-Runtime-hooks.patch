@@ -1,15 +1,12 @@
-From 4a5d1f13a3df66ee1066ca3ab39753ceb68568a8 Mon Sep 17 00:00:00 2001
-From: Ferrous Goose <ferrous@goose.invalid>
-Date: Sun, 25 Oct 2026 19:39:39 +1100
-Subject: [PATCH 4/8] Runtime hooks for libraries (Ferrous Goose 0004)
+From 7a2f9054d76959372ce88fb675d1134c40a8b315 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:24 +1100
+Subject: [PATCH] Provide runtime hooks to native libraries
 
-A library an extern block opens that exports goose_runtime_hooks is handed
-the runtime's abort, which ends a contained worker alone, and at_end, which
-has a function called as the program ends.
 ---
  docs/goose_spec.md         |   8 +-
+ src/capabilities.h         |   2 +-
  src/codegen_emit.h         |   2 +-
- src/ferrous.h              |   2 +-
  src/runtime/goose.h        |  11 +++
  src/runtime/runtime.h      |  18 +++-
  src/runtime/runtime_ext.h  |   9 ++
@@ -37,6 +34,16 @@ index b0ff6c2c..7c1d990d 100644
  applies to its block's members as to its other externs. A variadic C
  function cannot be bound: the declaration has no way to say so, and
  calling one through a fixed-arity pointer is undefined. The generated C is
+diff --git a/src/capabilities.h b/src/capabilities.h
+index af25e01f..b4a65e5c 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
+ #pragma once
+ 
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks"
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
 index 26773948..021025c7 100644
 --- a/src/codegen_emit.h
@@ -50,16 +57,6 @@ index 26773948..021025c7 100644
  }
  
  }  // namespace goose
-diff --git a/src/ferrous.h b/src/ferrous.h
-index df70dd75..abced685 100644
---- a/src/ferrous.h
-+++ b/src/ferrous.h
-@@ -3,4 +3,4 @@
- // lists so that cargo goose and goose_build know what the compiler can do.
- #pragma once
- 
--#define FERROUS_FEATURES "typed-builders export-results emit-interface"
-+#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks"
 diff --git a/src/runtime/goose.h b/src/runtime/goose.h
 index 3819ad62..2ae6bd69 100644
 --- a/src/runtime/goose.h
@@ -119,7 +116,7 @@ index 596ef768..876788fc 100644
  
  /* Starts the runtime on main's thread: the program's arguments, each
 diff --git a/src/runtime/runtime_ext.h b/src/runtime/runtime_ext.h
-index 241432b5..18c0086a 100644
+index 241432b5..8a29d02e 100644
 --- a/src/runtime/runtime_ext.h
 +++ b/src/runtime/runtime_ext.h
 @@ -26,6 +26,15 @@ static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
@@ -127,7 +124,7 @@ index 241432b5..18c0086a 100644
  }
  
 +/* Appends count elements of size bytes each to the T[>..] a typed builder
-+   points at (spec 7.10, Ferrous Goose 0001): the header counts elements. */
++   points at (spec 7.10): the header counts elements. */
 +static void gs_bld_push(gs_rref b, const void *p, int64_t count, int64_t size) {
 +    if (count <= 0) return;
 +    memcpy(b.stk->top, p, (size_t)(count * size));
@@ -222,7 +219,7 @@ index dc6d8dc8..f33914f2 100644
              if (binds[b].lib != l) continue;
  #ifdef _WIN32
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index 8dc9e0f5..eb4d05c2 100644
+index 8dc9e0f5..ae901413 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
 @@ -193,10 +193,23 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
@@ -595,7 +592,7 @@ index 8dc9e0f5..eb4d05c2 100644
  }
  
 +/* Appends count elements of size bytes each to the T[>..] a typed builder
-+   points at (spec 7.10, Ferrous Goose 0001): the header counts elements. */
++   points at (spec 7.10): the header counts elements. */
 +static void gs_bld_push(gs_rref b, const void *p, int64_t count, int64_t size) {
 +    if (count <= 0) return;
 +    memcpy(b.stk->top, p, (size_t)(count * size));
@@ -606,14 +603,13 @@ index 8dc9e0f5..eb4d05c2 100644
  /* ffi's cstr and bytes (stdlib/ffi.goose): the bytes at a pointer a C
     library handed back as a u64, copied into a builder, so nothing foreign
     is a Goose value without a copy. The pointer is trusted as every extern
-@@ -3620,14 +3665,14 @@ GS_API void gs_os_arg(int64_t i, gs_rref out);
- GS_API uint8_t gs_os_getenv(sl_u8 name, gs_rref out);
+@@ -3621,13 +3666,13 @@ GS_API uint8_t gs_os_getenv(sl_u8 name, gs_rref out);
  GS_API uint8_t gs_os_resource_dir(gs_rref out);
  GS_API int64_t gs_os_time_ns(void);
--GS_API int64_t gs_os_clock_ns(void);
+ GS_API int64_t gs_os_clock_ns(void);
+-GS_API void gs_os_sleep_ms(int64_t ms);
 +)GSRT"
-+R"GSRT(GS_API int64_t gs_os_clock_ns(void);
- GS_API void gs_os_sleep_ms(int64_t ms);
++R"GSRT(GS_API void gs_os_sleep_ms(int64_t ms);
  GS_API uint64_t gs_os_random_u64(void);
  /* os.trim_memory: discards unused complete pages of this thread program's
     data stacks. Defined with the region registry it walks (runtime_impl.h),
@@ -679,6 +675,3 @@ index 8dc9e0f5..eb4d05c2 100644
  /* Appends `count` elements of `size` bytes each to the T[>..] a typed
     builder points at (spec 7.10): the bytes are the elements as Goose lays
     them out, packed, and the header counts elements, not bytes. */
--- 
-2.54.0
-

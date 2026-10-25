@@ -52,12 +52,16 @@ jobs:
           cargo run -q -p cargo-goose -- run examples/regex/goose/find_emails.goose --manifest-path examples/regex/rust/Cargo.toml
           cargo run -q -p goose-embed-example
           cargo build -q --release -p cargo-goose
-          GOOSE_CARGO_GOOSE=$PWD/target/release/cargo-goose .toolchain/goose/build/goose run examples/regex/linked/find_emails.goose
-          GOOSE_CARGO_GOOSE=$PWD/target/release/cargo-goose .toolchain/goose/build/goose build examples/regex/linked/find_emails.goose
+          export PATH="$PWD/target/release:$PATH"
+          .toolchain/goose/build/goose run examples/regex/linked/find_emails.goose
+          .toolchain/goose/build/goose build examples/regex/linked/find_emails.goose
           cd examples/multi
-          GOOSE_CARGO_GOOSE=$PWD/../../target/release/cargo-goose ../../.toolchain/goose/build/goose run multi.goose
-          GOOSE_CARGO_GOOSE=$PWD/../../target/release/cargo-goose ../../.toolchain/goose/build/goose build multi.goose
+          ../../.toolchain/goose/build/goose run multi.goose
+          ../../.toolchain/goose/build/goose build multi.goose
           ./multi
+      - name: C native provider without Rust
+        if: runner.os != 'Windows'
+        run: python3 scripts/check-native-build.py
       - name: The overhead budget
         if: runner.os != 'Windows'
         run: bench/run.sh && cat bench/RESULTS.md >> "$GITHUB_STEP_SUMMARY"

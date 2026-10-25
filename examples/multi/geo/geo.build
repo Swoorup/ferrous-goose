@@ -1,2 +1,2 @@
-// The shapes crate as a package of this program, built and linked with it.
-cargo_crate = "../../shapes/rust";
+// The native build command runs from this package's root.
+native_build = ["cargo-goose", "native", "--manifest-path", "../../shapes/rust/Cargo.toml"];

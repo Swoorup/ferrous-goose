@@ -1,18 +1,14 @@
-From c70a2f91c82afd87a95616248855705f6e4eee06 Mon Sep 17 00:00:00 2001
-From: Ferrous Goose <ferrous@goose.invalid>
-Date: Sun, 25 Oct 2026 19:34:23 +1100
-Subject: [PATCH 3/8] The C interface as JSON: --emit-interface (Ferrous Goose
- 0003)
+From ae907108a0d87ecd90ac83692e60c160edc63a66 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:23 +1100
+Subject: [PATCH] Describe the native interface as JSON
 
-Each export's parameters and results, and the layout of every struct and
-enum they reach, as the backend lays them out; goose check
---emit-interface json writes only that.
 ---
  docs/goose_spec.md |   9 ++
- src/ferrous.h      |   2 +-
- src/interface.h    | 222 +++++++++++++++++++++++++++++++++++++++++++++
+ src/capabilities.h |   2 +-
+ src/interface.h    | 221 +++++++++++++++++++++++++++++++++++++++++++++
  src/main.cpp       |  22 ++++-
- 4 files changed, 252 insertions(+), 3 deletions(-)
+ 4 files changed, 251 insertions(+), 3 deletions(-)
  create mode 100644 src/interface.h
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
@@ -35,27 +31,26 @@ index b114899a..b0ff6c2c 100644
  An exported C symbol is emitted as written, as an `extern` one is, and must be a
  C identifier that is not a C keyword and that the program does not otherwise
  reserve (`main`, `goose_init`, or a name beginning with `gs_`).
-diff --git a/src/ferrous.h b/src/ferrous.h
-index 8ed6a6ff..df70dd75 100644
---- a/src/ferrous.h
-+++ b/src/ferrous.h
-@@ -3,4 +3,4 @@
- // lists so that cargo goose and goose_build know what the compiler can do.
+diff --git a/src/capabilities.h b/src/capabilities.h
+index 0e629230..af25e01f 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
  #pragma once
  
--#define FERROUS_FEATURES "typed-builders export-results"
-+#define FERROUS_FEATURES "typed-builders export-results emit-interface"
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders export-results"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface"
 diff --git a/src/interface.h b/src/interface.h
 new file mode 100644
-index 00000000..6c36303f
+index 00000000..7890a0cf
 --- /dev/null
 +++ b/src/interface.h
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,221 @@
 +// Goose compiler — the program's C interface as JSON (`--emit-interface`):
 +// its export fns with their parameters and results, and the layout of
 +// every struct and enum they reach, as the C backend lays them out (C.2).
-+// What a binding generator in another language (Ferrous Goose's
-+// goose_build, for Rust) builds its side from, and what it checks a
++// What a binding generator in another language  builds its side from, and what it checks a
 +// binding it wrote against. Written by the backend, which owns the layouts;
 +// `goose check --emit-interface` runs it for that and writes nothing else.
 +#pragma once
@@ -165,7 +160,7 @@ index 00000000..6c36303f
 +    string Write(const string &runtime, const string &features) {
 +        out = "{\"format\":1,\"goose_runtime\":";
 +        JsonQuote(out, runtime);
-+        out += ",\"ferrous\":";
++        out += ",\"features\":";
 +        JsonQuote(out, features);
 +        out += ",\"sources\":[";
 +        for (size_t i = 0; i < ast.sources.size(); i++) {
@@ -274,7 +269,7 @@ index 00000000..6c36303f
 +
 +}  // namespace goose
 diff --git a/src/main.cpp b/src/main.cpp
-index 8d5ae6d1..42c24482 100644
+index 0c3f9b92..0fd1b18b 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -45,6 +45,7 @@
@@ -328,7 +323,7 @@ index 8d5ae6d1..42c24482 100644
 +        // The C interface as JSON: to stdout for `json` or `-`, else the
 +        // file named (interface.h).
 +        if (!interfacename.empty()) {
-+            auto text = InterfaceJson(cg, ast, RuntimeVersion(), FERROUS_FEATURES);
++            auto text = InterfaceJson(cg, ast, RuntimeVersion(), GOOSE_FEATURES);
 +            if (interfacename == "json" || interfacename == "-") {
 +                fwrite(text.data(), 1, text.size(), stdout);
 +            } else {
@@ -341,6 +336,3 @@ index 8d5ae6d1..42c24482 100644
          // The packages whose native parts the program needs, which a JIT
          // run takes functions from and a build links: its own, when it has
          // one, and every package an extern fn it calls was declared in,
--- 
-2.54.0
-

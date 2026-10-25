@@ -17,7 +17,7 @@ pub enum Link {
     /// `goose run` needs, and what Phase 1 uses everywhere.
     Dynamic(String),
     /// Plain `extern fn` declarations, the library linked into the program
-    /// (a `cargo_crate` sidecar key, goose-patches/0005).
+    /// (a `native_build` provider, goose-patches/0005).
     Static,
 }
 

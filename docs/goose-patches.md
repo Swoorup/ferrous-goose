@@ -1,58 +1,111 @@
 # The Goose patch series
 
-Ferrous Goose pins Goose at
-[`e76d5c9f`](https://github.com/aardappel/goose/commit/e76d5c9f7f0a17d83c12a405fbb2513094d03985)
-and carries the compiler changes the proposal's later phases call for as
-patches against it, in [goose-patches/](../goose-patches/).
-`scripts/toolchain.sh` applies them in order and builds the compiler into
-`.toolchain/goose/build/goose`; `--stock` builds the pinned commit alone into
-`.toolchain/goose-stock/`.
+The compiler changes in [goose-patches/](../goose-patches/) apply in order to
+Goose commit `e76d5c9f7f0a17d83c12a405fbb2513094d03985`.
+`scripts/toolchain.sh` builds them into `.toolchain/goose/build/goose`;
+`--stock` builds the pinned compiler without the patches.
 
-A patched compiler lists what it carries:
+These patches describe a native interface usable from C, Rust or another
+language. The compiler contains no Cargo commands, Rust crate metadata or
+binding-project capability registry. Cargo integration remains in the Rust
+tooling, which implements the generic native-build provider protocol.
+
+A compiler advertises capabilities separately from its native layout ABI:
 
 ```
-$ goose version
-goose runtime 43500621d6a0
-ferrous: typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs align reentrant
+goose runtime <runtime-hash>
+features: typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align reentrant
+native-abi: 1
 ```
 
-`cargo goose` and `goose_build` read that line and use what is there, so
-the same crate works with either compiler: where a feature is missing the
-bindings fall back (a typed builder becomes a count and a copy) or leave out
-what cannot be expressed (an aligned enum), saying so in the module.
+`features:` describes supported operations. `native-abi: 1` identifies the
+public native value layouts (slices, builder headers/references and stack
+control blocks); it does not promise that a compiler supports every optional
+operation. Runtime-hook structs carry their own version. A feature list by
+itself is not evidence of ABI compatibility.
 
-Each patch updates the spec (`docs/goose_spec.md`, or `docs/packages.md`)
-with its rule. Goose's own test suite passes with the series applied
-(`python3 test/run_tests.py --profile baseline --cc native`: every section,
-about 4,750 checks).
+`cargo goose` and `goose_build` read the neutral feature line. Stock compilers
+still work through the existing fallbacks: vector results use a length/copy
+protocol; declarations requiring an unavailable feature are omitted with a
+comment. Older experimental compilers with only a `ferrous:` line should be
+rebuilt with `scripts/toolchain.sh`.
 
-| Patch | Feature | Phase | What it changes |
-|---|---|---|---|
-| 0001 | `typed-builders` | 2 | An extern fn may take `T[>..]&` of any flat fixed-size `T`: C appends whole elements at the stack's top and counts them in the header (`gs_bld_push` in `goose.h`). Rust's `Vec<T>` results and span lists use it. Also adds the `ferrous:` line to `goose version`. |
-| 0002 | `export-results` | 2 | An `export fn` may have several results (the first is C's return value, the others out-pointers) and builder parameters: the runtime keeps a scratch builder per parameter, whose elements and count the wrapper hands back, valid until the next exported call. |
-| 0003 | `emit-interface` | 2 | `--emit-interface out.json` (and `goose check --emit-interface json`): each export's parameters and results, and the layout of every struct and enum they reach, as the backend lays them out. `goose_build` builds its Rust from it; `cargo goose` checks generated modules against it. |
-| 0004 | `runtime-hooks` | 2 | A library an extern block opens that exports `goose_runtime_hooks` is handed the runtime's abort (which ends a contained worker alone, as any Goose abort does) and `at_end` (a function called when the program ends; the Rust side prints its leak report there in debug builds). `gs_fail` names a place with no line alone. |
-| 0005 | `cargo-crate` | 2 | `cargo_crate = "dir";` and `cargo_features` in a sidecar: the compiler runs `cargo goose native` as the sidecar loads, which builds the crate and writes its module; `goose build` links the static library, `goose run` builds the JIT library from it, and the program hands the crate the runtime's hooks. Several crates in one program link as one static library, an umbrella crate `cargo goose combine` builds; a package whose module its crate writes needs only its sidecar. |
-| 0006 | `package-dylibs` | 4 | A `./` spelling in a package's `dylibs` entry is a file from the package's own root, so a package can ship a prebuilt library per platform; `dylibs_<platform>_x86_64` and `dylibs_<platform>_arm64` override `dylibs_<platform>` where the compiler runs on that architecture. |
-| 0007 | `align` | 2, 3 | `align n` among a struct's fields or an enum's variants: every value of the type sits at a multiple of n (its C type is aligned, and a growable array of it starts at an aligned stack top). An aligned enum's tag takes n bytes, so its payload starts at n: Rust's `#[repr(C, u8)]` layout. The rules that keep elements aligned (size a multiple of n, aligned fields in aligned containers, no limited or variable arrays of it) are compile errors. |
-| 0008 | `reentrant` | 3 | `reentrant` before an extern's `fn`: its C may call the program's export fns back. Its callers publish every cached stack top first, so a call back starts above all live data. The program registers its export fns as it starts; the runtime's hooks (version 2) add `reentry_lookup(name, sig, &why)`, which finds one by C symbol and signature and refuses one touching a `var` global, and `on_program_thread()`. |
+| Patch | Capability | General native-interface purpose |
+|---|---|---|
+| 0001 | `typed-builders` | Allow an extern to append whole flat, fixed-size elements to a `T[>..]&`; `gs_bld_push` counts elements. Also report compiler capabilities and native ABI. |
+| 0002 | `export-results` | Export multiple results using a return value and out-pointers. Export builders use runtime scratch storage borrowed until the next exported call. |
+| 0003 | `emit-interface` | Describe exports and reachable type layouts as JSON for binding generators and ABI checks. |
+| 0004 | `runtime-hooks` | Offer native libraries the program's abort behavior and end-of-program callbacks. |
+| 0005 | `native-build` | Run an external provider which supplies generated modules, a static library, linker arguments and optional hook/combiner metadata. |
+| 0006 | `package-dylibs` | Resolve package-relative prebuilt libraries, with platform and architecture overrides. |
+| 0007 | `align` | Keep declared structs/enums aligned in variables, arrays and data stacks. Enforce size, field-placement and supported-container constraints. |
+| 0008 | `reentrant` | Permit native code to call program exports while a native call is running, publishing stack tops and enforcing callback eligibility. |
 
-## Callbacks, two ways
+## External native builders
 
-0008 is the change the proposal lists for Phase 3: nested calls that start
-above every live data stack top, so Rust can call Goose export fns while
-Goose waits on it (`&goose::Reentry`, `goose::callbacks!`). A Rust function
-taking a closure needs no patch: it runs as a coroutine (corosensei) on its
-own stack, on the Goose thread, each call of the closure handing its
-arguments to the caller's block. See [design.md](design.md#callbacks).
+For this repository's Rust provider, a sidecar is:
 
-## Working on the series
-
-`.toolchain/goose-dev` is a clone with one commit per patch:
-
-```sh
-git -C .toolchain/goose-dev format-patch -o ../../goose-patches e76d5c9f7f0a17d83c12a405fbb2513094d03985
+```goose
+native_build = ["cargo-goose", "native", "--manifest-path", "../rust/Cargo.toml"];
 ```
 
-After editing `src/runtime/`, regenerate the embedded copy with
-`build/goose --gen-runtime-header` and rebuild before committing.
+The command is an argv list, run from the package root with no shell
+expansion. Goose appends these provider arguments:
+
+- `--out-dir`: the absolute package root, where generated modules belong.
+- `--cache-dir`: a directory available for cached build products.
+- `--compiler`: the absolute Goose executable used for this compilation.
+- `--include-dir`: a directory containing the compiler's public `goose.h`.
+
+A provider prints a final report line after any build logs:
+
+```
+goose-native: {"version":1,"staticlib":"/abs/libnative.a","native_libs":["-lm"],"runtime_hooks":"native_init"}
+```
+
+`staticlib` is required and must exist; relative paths are resolved from the
+provider's working directory. `native_libs` optionally contains linker
+arguments. `runtime_hooks` optionally names an initializer taking
+`const gs_rt_hooks *`. Goose links the archive for a native build, or builds
+a library around it for the JIT. The language server never runs providers.
+
+A provider may also report `combine` (an argv command) and `combine_input`
+(an opaque string). When several packages name the same combiner, Goose
+invokes it with `--out-dir <cache>` and repeated `--input <opaque-string>`
+arguments. It returns the same versioned library report. The Rust provider
+uses this to build one umbrella crate, avoiding duplicate Rust runtime
+symbols; none of that interpretation lives in Goose.
+
+`cargo_features` and `cargo_crate` are replaced by explicit arguments to the
+provider command. For example, append `"--features", "unicode"` to enable
+Cargo features. Put `cargo-goose` on PATH (`cargo install --path
+crates/cargo-goose`); a sidecar can instead name any provider executable by
+absolute path. See `scripts/check-native-build.py` for a plain C provider
+which exercises builders and hooks with no Rust on PATH.
+
+## Layout and lifetime policies
+
+Alignment makes borrowing possible; it does not prove identical layouts or
+remove validity checks. In the current aligned-enum representation the tag
+occupies the alignment-sized prefix. This policy is retained for existing
+bindings; independently choosing tag width and payload alignment is a
+separate language-layout design, not implied by removing project coupling.
+
+Export scratch builders remain valid until the next exported call. Rust
+bindings enforce that lifetime through a mutable runtime borrow. Other
+hosts must enforce it themselves.
+
+Reentrant exports must run on the program thread and may not access a
+mutable `var` global, including through callees. Rust closure-style callbacks
+use a separate coroutine implementation that works with stock Goose.
+
+The current performance guarantees and a proposed strict zero-copy mode are
+explained in [performance.md](performance.md).
+
+## Maintaining the series
+
+Reconstruct the pinned compiler, apply each patch in order and keep one
+commit per feature in an isolated development clone. Regenerate patches
+against the pinned commit after changes. After editing `src/runtime/`, run
+`build/goose --gen-runtime-header` and rebuild so `runtime_inline.h` matches
+the source runtime.

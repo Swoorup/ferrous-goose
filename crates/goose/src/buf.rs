@@ -80,7 +80,7 @@ impl Extend<u8> for GooseBuf<'_> {
     }
 }
 
-/// A typed builder, Goose's `T[>..]&` (goose-patches/0002): values are
+/// A typed builder, Goose's `T[>..]&` (goose-patches/0001): values are
 /// appended as Goose stores them, and the count grows by one per value.
 pub struct GooseVec<'call, T: Value> {
     raw: GsRref,

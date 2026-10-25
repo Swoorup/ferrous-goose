@@ -64,7 +64,7 @@ builds. Everything Phase 1 promises works on the stock compiler.
 | [crates/goose-build](crates/goose-build) | `goose_build` for build.rs: compiles a Goose program into a crate and writes safe Rust bindings |
 | [goose-patches](goose-patches) | the Goose changes, one patch per feature ([docs/goose-patches.md](docs/goose-patches.md)) |
 | [conformance](conformance) | every row of the type map, in both directions, with the negative cases |
-| [examples](examples) | the regex crate from Goose (dynamically and linked with `cargo_crate`), two crates in one program, Goose kernels from Rust, shapes |
+| [examples](examples) | the regex crate from Goose (dynamically and linked through a native-build provider), two crates in one program, Goose kernels from Rust, shapes |
 | [packages](packages) | Goose packages over regex, serde_json, image and rusqlite, prebuilt per platform |
 | [bench](bench) | the overhead budget: what the checks cost per call ([bench/RESULTS.md](bench/RESULTS.md)) |
 | [docs](docs) | [the design](docs/design.md), [the type map](docs/type-map.md), [the patches](docs/goose-patches.md), [the phases and their status](docs/phases.md) |
@@ -93,12 +93,15 @@ cargo goose bindings -o ns.goose   # just the module
 ```
 
 or, with the patched compiler, a sidecar that builds and links the crate
-itself, so `goose run` and `goose build` need nothing else:
+through an external provider, so `goose run` and `goose build` invoke it automatically:
 
 ```goose
 // find_emails.build
-cargo_crate = "../rust";
+native_build = ["cargo-goose", "native", "--manifest-path", "../rust/Cargo.toml"];
 ```
+
+`cargo-goose` must be on PATH; the command runs from the sidecar's directory.
+The compiler's provider protocol is language-neutral ([details](docs/goose-patches.md#external-native-builders)).
 
 Rust may call the program back while it waits (the patched compiler):
 
@@ -118,6 +121,9 @@ A package anyone can use without Rust:
 ```sh
 cargo goose package dist --targets aarch64-apple-darwin,x86_64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu --zig
 ```
+
+Copying and validation costs, and a proposed strict zero-copy mode, are
+described in [docs/performance.md](docs/performance.md).
 
 ## Testing
 

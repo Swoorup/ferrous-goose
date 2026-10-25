@@ -8,7 +8,7 @@ publish = false
 
 [lib]
 # cdylib for goose run (an extern block opens it), staticlib for a
-# cargo_crate build that links it, rlib for Rust tests.
+# native provider build that links it, rlib for Rust tests.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]

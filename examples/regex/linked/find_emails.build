@@ -1,3 +1,2 @@
-// The crate is built and linked into the program (goose-patches/0005):
-// goose run and goose build need nothing else.
-cargo_crate = "../rust";
+// The native build command runs from this package's root.
+native_build = ["cargo-goose", "native", "--manifest-path", "../rust/Cargo.toml"];

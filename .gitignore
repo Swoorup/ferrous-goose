@@ -17,3 +17,6 @@
 /examples/shapes/goose/geo.goose
 /examples/regex/goose/rx.goose
 /conformance/rust/goose-tests/cf.goose
+
+# Local session notes
+/.archive/

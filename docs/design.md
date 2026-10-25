@@ -8,8 +8,8 @@ proposal it says so.
 ## Goals
 
 - No C anywhere: no shims, no headers, no hand-written unsafe on either side.
-- Zero-copy where layouts allow: slices, flat structs and builders cross as
-  they are.
+- Borrow compatible slices and flat structs in place; direct builders can
+  produce output in Goose storage. Owned results and conversions still copy.
 - Both languages' rules hold, enforced by generated code.
 - Both build paths: `goose run` (no C toolchain) and `goose build`.
 - Both directions.
@@ -63,11 +63,13 @@ symbols are `ns_name`. Rust doc comments are copied as Goose comments.
    starts: `cargo goose run` points the loader at the build, `cargo goose
    build` maps the library in the program's sidecar. Works with the stock
    compiler, under `goose run` and `goose build`.
-2. `cargo_crate = "rust";` in the sidecar (goose-patches/0005): the
-   compiler builds the crate, writes the module, links the static library
-   into a `goose build` executable and builds the JIT library from it for
-   `goose run`. Several crates in one program (packages each naming their
-   own) link as one static library.
+2. `native_build = ["cargo-goose", "native", "--manifest-path", "rust/Cargo.toml"];`
+   in the sidecar (goose-patches/0005): the compiler invokes an external
+   provider using a versioned language-neutral protocol. The Rust provider
+   builds the crate and writes the module, reports the static archive and
+   linker arguments, and offers a combiner for several crates. Goose links
+   the archive for a native build or makes the JIT library from it. Cargo
+   metadata and umbrella-crate construction stay in `cargo goose`.
 3. A package (goose-patches/0006): the module and a prebuilt library per
    platform, mapped with `./` paths in the package's sidecar. No Rust needed.
 
@@ -247,7 +249,7 @@ they are read.
   the program starts: a library built with another ABI fails there, naming
   the symbol, rather than misbehave.
 - `cargo goose` compares the compiler's runtime with the ones the bridge was
-  checked against (a compiler carrying the patch series is one) and refuses
+  checked against (including compilers advertising native ABI 1) and refuses
   others unless told `--allow-runtime`.
 - With `--emit-interface`, every generated module's layouts are checked
   against the compiler's.
@@ -264,9 +266,9 @@ its checks, `&str` adds UTF-8 validation (linear in the length; take
 ## Open questions, as built
 
 - **Several crates, one program.** Under extern blocks each crate is its own
-  library, so a program may use any number. Linked (`cargo_crate`), two Rust
-  static libraries would define Rust's own symbols twice, so the compiler has
-  `cargo goose combine` build one: an umbrella crate depending on every
+  library, so a program may use any number. Linked (`native_build`), two Rust
+  static libraries would define Rust's own symbols twice. The Rust provider
+  offers `cargo goose combine` to build one: an umbrella crate depending on every
   crate the program names (each needs `rlib` among its crate types).
   `examples/multi` uses two, under `goose run` and `goose build`.
 - **Packages per architecture.** A package's sidecar may map a library per
@@ -275,5 +277,10 @@ its checks, `&str` adds UTF-8 validation (linear in the length; take
   `lib/<os>-<arch>/`, and macOS gets one universal library.
 - **Catching Goose aborts from Rust.** Unchanged: an abort inside a Goose
   export ends the process.
-- **Check opt-outs.** None: the checks are cheap next to the work behind
-  them (see the budget), and `align n` removes the copy path.
+- **Check opt-outs.** None: validation remains part of safe exports. Its
+  relative cost depends on the workload (see the budget). Compatible
+  layouts with `align n` avoid the alignment copy fallback.
+
+The current copy paths, measured overhead and a proposed strict zero-copy
+export contract are described in [performance.md](performance.md). That
+contract is a proposal; current exports retain safe copy fallbacks.

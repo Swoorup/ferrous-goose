@@ -43,7 +43,7 @@ pub struct Built {
     pub c_file: PathBuf,
     pub rust_file: PathBuf,
     pub interface: iface::Interface,
-    /// The Ferrous Goose patches the compiler carries.
+    /// The native-interface capabilities the compiler advertises.
     pub features: Vec<String>,
 }
 
@@ -177,13 +177,16 @@ pub fn find_goose(start: &Path) -> Result<PathBuf, String> {
     Err("cannot find the Goose compiler: set GOOSE or put goose on PATH".into())
 }
 
-/// The Ferrous Goose patches the compiler lists in `goose version`.
+/// The native-interface capabilities listed in `goose version`.
 pub fn goose_features(goose: &Path) -> Result<Vec<String>, String> {
     let out = Command::new(goose).arg("version").output().map_err(|e| format!("cannot run {}: {e}", goose.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} version failed: {}", goose.display(), String::from_utf8_lossy(&out.stderr)));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     Ok(text
         .lines()
-        .find_map(|l| l.strip_prefix("ferrous:"))
+        .find_map(|l| l.strip_prefix("features:"))
         .map(|f| f.split_whitespace().map(String::from).collect())
         .unwrap_or_default())
 }

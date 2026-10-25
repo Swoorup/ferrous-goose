@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the Goose compiler Ferrous Goose is tested against: the pinned commit
-# below with the patch series in goose-patches/ applied (docs/goose-changes.md).
+# below with the patch series in goose-patches/ applied (docs/goose-patches.md).
 #
 #   scripts/toolchain.sh            build into .toolchain/goose/build/goose
 #   scripts/toolchain.sh --stock    the pinned commit without the patches,
@@ -33,7 +33,7 @@ series=""
 if [[ $stock == 0 ]]; then
     series=$(cat "$root"/goose-patches/*.patch 2>/dev/null | git hash-object --stdin | cut -c1-12)
 fi
-stamp="$dir/.ferrous-series"
+stamp="$dir/.native-series"
 if [[ ! -f "$stamp" || "$(cat "$stamp")" != "$GOOSE_COMMIT $series" ]]; then
     git -C "$dir" checkout -q -f --detach "$GOOSE_COMMIT"
     git -C "$dir" clean -q -fdx -e build

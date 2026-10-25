@@ -1,22 +1,18 @@
-From 5c6da17b89b953dc0e9e8db45af56727a93c0025 Mon Sep 17 00:00:00 2001
-From: Ferrous Goose <ferrous@goose.invalid>
-Date: Sun, 25 Oct 2026 19:52:35 +1100
-Subject: [PATCH 7/8] align n for structs and enums (Ferrous Goose 0007)
+From 00250656cec85d5a10b0efe50365a02025f68b37 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:27 +1100
+Subject: [PATCH] Support explicit alignment for structs and enums
 
-Every value of an aligned type lives at a multiple of n: its C type is
-aligned and a growable array of such values starts at an aligned stack top.
-An aligned enum's tag takes n bytes, so its payload starts at n, the layout
-of a Rust #[repr(C, u8)] enum.
 ---
  docs/goose_spec.md      | 13 +++++++
  src/ast.h               |  7 ++++
+ src/capabilities.h      |  2 +-
  src/codegen.h           | 11 +++++-
  src/codegen_construct.h |  1 +
  src/codegen_emit.h      |  1 +
  src/codegen_stmts.h     |  1 +
  src/codegen_types.h     | 75 ++++++++++++++++++++++++++++++++++++++---
  src/codegen_values.h    |  1 +
- src/ferrous.h           |  2 +-
  src/interface.h         |  5 +--
  src/parser.h            | 36 ++++++++++++++++++--
  src/runtime/runtime.h   |  9 +++++
@@ -24,7 +20,7 @@ of a Rust #[repr(C, u8)] enum.
  13 files changed, 167 insertions(+), 16 deletions(-)
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index 7c1d990d..509c85b1 100644
+index 7c1d990d..161c62d3 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
 @@ -265,6 +265,19 @@ struct X { a: i8[3], b: i32, c: i64 = 0 }
@@ -43,19 +39,19 @@ index 7c1d990d..509c85b1 100644
 +  aligned, and an aligned type is at most 4096 bytes and is no element of a
 +  limited or variable array, whose length goes before the elements. An
 +  aligned enum's tag takes n bytes, so its payload starts at n: the layout of
-+  a Rust `#[repr(C, u8)]` enum, given the same pads. Ferrous Goose 0007.
++  a Rust `#[repr(C, u8)]` enum, given the same pads.
  * Fields are mutable by default; `let` before a field name means the field
    is not assigned after construction (§4.4), and `const f: T` is `let f:
    const T`: its contents are read-only too (§9.5).
 diff --git a/src/ast.h b/src/ast.h
-index 61578de8..58bbc69e 100644
+index f6739302..79bc5090 100644
 --- a/src/ast.h
 +++ b/src/ast.h
 @@ -1496,6 +1496,10 @@ struct SStruct {
      string_view name;
      string_view ns;             // As SFunction::ns / qname.
      string_view qname;
-+    // `align n` (Ferrous Goose 0007): every value of the type lives at an
++    // `align n`: every value of the type lives at an
 +    // address that is a multiple of n, in a variable, an element or on a
 +    // data stack; 1 for none.
 +    int64_t align = 1;
@@ -66,14 +62,24 @@ index 61578de8..58bbc69e 100644
      string_view name;
      string_view ns;             // As SFunction::ns / qname.
      string_view qname;
-+    // `align n` (Ferrous Goose 0007): as SStruct::align, and the tag takes n
++    // `align n`: as SStruct::align, and the tag takes n
 +    // bytes, so the payload starts at n.
 +    int64_t align = 1;
      Line line;
      Line end;                   // As SFunction::end.
      string_view doc;            // As SFunction::doc.
+diff --git a/src/capabilities.h b/src/capabilities.h
+index 09243cac..1eaecbc4 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
+ #pragma once
+ 
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align"
 diff --git a/src/codegen.h b/src/codegen.h
-index 26dd84eb..9ad7e28e 100644
+index 26dd84eb..516feb68 100644
 --- a/src/codegen.h
 +++ b/src/codegen.h
 @@ -311,7 +311,16 @@ struct CodeGen {
@@ -83,7 +89,7 @@ index 26dd84eb..9ad7e28e 100644
 -    IntStorage TagStore(SEnum *en) { return en->variants.size() <= 256 ? IS_U8 : IS_U16; }
 +    IntStorage TagStore(SEnum *en) {
 +        // An aligned enum's tag fills the alignment, so the payload starts
-+        // aligned (Ferrous Goose 0007).
++        // aligned.
 +        if (en->align >= 8) return IS_U64;
 +        if (en->align == 4) return IS_U32;
 +        if (en->align == 2 || en->variants.size() > 256) return IS_U16;
@@ -107,7 +113,7 @@ index 994ef40d..9403c68f 100644
                  L(flv, ".len = 0;");
                  GenConstruct(init, stk, ft, cat(flv, ".len"));
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 525ff134..50d4aac9 100644
+index 9255b598..4fa98cd6 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
 @@ -851,6 +851,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
@@ -131,14 +137,14 @@ index 8e4fbef6..f4ac5866 100644
      if (own) SaveBase(forlocal, stk, cat(name, ".base"));
      if (d->reusable) {
 diff --git a/src/codegen_types.h b/src/codegen_types.h
-index e42fd637..1ccc9046 100644
+index e42fd637..82213fad 100644
 --- a/src/codegen_types.h
 +++ b/src/codegen_types.h
 @@ -240,8 +240,27 @@ inline const char *CodeGen::RelCT(TypeExpr *rt) {
  // StructInst / (EnumInst, variant).
  
  // The alignment `pad` (bare form) gives the next field: its scalar width.
-+// The alignment `align n` gives a type's values (Ferrous Goose 0007): its
++// The alignment `align n` gives a type's values: its
 +// own, or its elements' for a fixed array; 1 for everything else.
 +inline int64_t CodeGen::AlignOf(TypeExpr *t) {
 +    switch (t->kind) {
@@ -169,7 +175,7 @@ index e42fd637..1ccc9046 100644
 +// An aligned field must sit at a multiple of its alignment in a container
 +// at least as aligned, `base` bytes into it (an enum's payload), and an
 +// aligned type's size must be a multiple of its alignment, so that its
-+// elements stay aligned too (Ferrous Goose 0007).
++// elements stay aligned too.
 +inline void CheckAlignedLayout(CodeGen &cg, string_view what, Line line, int64_t align, int64_t base,
 +                               const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
 +                               const CodeGen::Layout &lo) {
@@ -275,21 +281,11 @@ index 9dfa43c8..87ac3ab5 100644
          L("gs_rhdr ", h, " = { ", Top(stk), ", 0 };");
          SaveBase(false, stk, cat(h, ".base"));
      }
-diff --git a/src/ferrous.h b/src/ferrous.h
-index 96ecb1ad..f0fd8cf2 100644
---- a/src/ferrous.h
-+++ b/src/ferrous.h
-@@ -3,4 +3,4 @@
- // lists so that cargo goose and goose_build know what the compiler can do.
- #pragma once
- 
--#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs"
-+#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs align"
 diff --git a/src/interface.h b/src/interface.h
-index 6c36303f..d03b0847 100644
+index 7890a0cf..899b5886 100644
 --- a/src/interface.h
 +++ b/src/interface.h
-@@ -171,7 +171,8 @@ struct InterfaceWriter {
+@@ -170,7 +170,8 @@ struct InterfaceWriter {
                  JsonQuote(out, si->st->qname);
                  out += ",\"doc\":";
                  JsonQuote(out, si->st->doc);
@@ -299,7 +295,7 @@ index 6c36303f..d03b0847 100644
                  Fields(si->st->fields, si->ftypes, lo);
                  out += "}";
                  if (types.back() != '[') types += ",";
-@@ -192,7 +193,7 @@ struct InterfaceWriter {
+@@ -191,7 +192,7 @@ struct InterfaceWriter {
              out += ",\"doc\":";
              JsonQuote(out, ei->en->doc);
              Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
@@ -309,7 +305,7 @@ index 6c36303f..d03b0847 100644
                  if (vi) out += ",";
                  auto &v = ei->en->variants[vi];
 diff --git a/src/parser.h b/src/parser.h
-index 25400ee2..2e150dde 100644
+index 25400ee2..148d1714 100644
 --- a/src/parser.h
 +++ b/src/parser.h
 @@ -533,7 +533,7 @@ struct Parser {
@@ -325,7 +321,7 @@ index 25400ee2..2e150dde 100644
          ast.topdecls.push_back(Finish(New<StructDecl>(line, st)));
      }
  
-+    // `align n` where a member may go (Ferrous Goose 0007): an identifier
++    // `align n` where a member may go: an identifier
 +    // `align` followed by an integer, which a field named align (followed by
 +    // `:`) is not. Sets `*align`, or is an error where none is given (a
 +    // variant's fields). True when it was one.
@@ -373,14 +369,14 @@ index 25400ee2..2e150dde 100644
                  v.line = CurLine();
                  v.doc = lex.doc;
 diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
-index 876788fc..6c1c118d 100644
+index 876788fc..6ae936a5 100644
 --- a/src/runtime/runtime.h
 +++ b/src/runtime/runtime.h
 @@ -830,6 +830,15 @@ typedef struct {
     gets nothing more. */
  #define GOOSE_H 1
  
-+/* `align n` (Ferrous Goose 0007): the C type of an aligned struct or enum,
++/* `align n`: the C type of an aligned struct or enum,
 +   and a data stack top rounded up for its elements. */
 +#if defined(_MSC_VER) && !defined(__clang__)
 +#define GS_ALIGNED(n) __declspec(align(n))
@@ -393,14 +389,14 @@ index 876788fc..6c1c118d 100644
     region's usable reservation and trailing guard gap, the address space
     budgeted for regions over the whole program, and the most regions the
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index eb4d05c2..883a159d 100644
+index ae901413..87a69a04 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
 @@ -846,6 +846,15 @@ typedef struct {
     gets nothing more. */
  #define GOOSE_H 1
  
-+/* `align n` (Ferrous Goose 0007): the C type of an aligned struct or enum,
++/* `align n`: the C type of an aligned struct or enum,
 +   and a data stack top rounded up for its elements. */
 +#if defined(_MSC_VER) && !defined(__clang__)
 +#define GS_ALIGNED(n) __declspec(align(n))
@@ -452,6 +448,3 @@ index eb4d05c2..883a159d 100644
     walk finishes, so every read here is bounded by the image end and reports
     a malformed encoding instead of running past it. */
  
--- 
-2.54.0
-

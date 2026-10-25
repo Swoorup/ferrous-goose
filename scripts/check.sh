@@ -16,6 +16,10 @@ cargo test -q --workspace 2>&1 | grep -E 'test result|FAILED|panicked' | sort | 
 
 cargo build -q --release -p cargo-goose
 cg="$root/target/release/cargo-goose"
+export PATH="$root/target/release:$PATH"
+
+step "C native provider (patched)"
+python3 scripts/check-native-build.py "$patched"
 
 for g in "$stock" "$patched"; do
     name=$([[ "$g" == "$stock" ]] && echo stock || echo patched)
@@ -29,13 +33,13 @@ for g in "$stock" "$patched"; do
     GOOSE="$g" cargo run -q -p goose-embed-example | tail -1
 done
 
-step "cargo_crate (patched)"
-GOOSE_CARGO_GOOSE="$cg" "$patched" run examples/regex/linked/find_emails.goose | tail -1
-GOOSE_CARGO_GOOSE="$cg" "$patched" build examples/regex/linked/find_emails.goose >/dev/null
+step "Rust native provider (patched)"
+"$patched" run examples/regex/linked/find_emails.goose | tail -1
+"$patched" build examples/regex/linked/find_emails.goose >/dev/null
 examples/regex/linked/find_emails | tail -1
 step "two crates in one program (patched)"
-(cd examples/multi && GOOSE_CARGO_GOOSE="$cg" "$patched" run multi.goose | tail -1)
-(cd examples/multi && GOOSE_CARGO_GOOSE="$cg" "$patched" build multi.goose >/dev/null && ./multi | tail -1)
+(cd examples/multi && "$patched" run multi.goose | tail -1)
+(cd examples/multi && "$patched" build multi.goose >/dev/null && ./multi | tail -1)
 
 if [[ -n "${SKIP_PACKAGES:-}" ]]; then
     step "all checks passed (packages skipped)"

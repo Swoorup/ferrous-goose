@@ -41,8 +41,10 @@ pub fn find_goose(explicit: Option<&str>) -> Result<PathBuf, String> {
 #[derive(Clone, Debug, Default)]
 pub struct GooseInfo {
     pub runtime: String,
-    /// The Ferrous Goose patches the compiler carries (goose-patches/).
+    /// Native-interface capabilities advertised by the compiler.
     pub features: Vec<String>,
+    /// Version of the public native value layouts; independent of features.
+    pub native_abi: Option<u32>,
 }
 
 impl GooseInfo {
@@ -56,18 +58,29 @@ pub fn goose_info(goose: &Path) -> Result<GooseInfo, String> {
         .arg("version")
         .output()
         .map_err(|e| format!("cannot run {}: {e}", goose.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} version failed: {}", goose.display(), String::from_utf8_lossy(&out.stderr)));
+    }
     let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    parse_goose_info(&text).map_err(|e| format!("{} version: {e}", goose.display()))
+}
+
+/// Parse the neutral compiler capability report. Stock compilers advertise no features.
+pub fn parse_goose_info(text: &str) -> Result<GooseInfo, String> {
     let mut info = GooseInfo::default();
     for line in text.lines() {
         if let Some(r) = line.trim().strip_prefix("goose runtime ") {
             info.runtime = r.trim().to_string();
         }
-        if let Some(f) = line.trim().strip_prefix("ferrous:") {
+        if let Some(f) = line.trim().strip_prefix("features:") {
             info.features = f.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        if let Some(abi) = line.trim().strip_prefix("native-abi:") {
+            info.native_abi = Some(abi.trim().parse().map_err(|_| "invalid native ABI version")?);
         }
     }
     if info.runtime.is_empty() {
-        return Err(format!("{} version printed no runtime: is it the Goose compiler?", goose.display()));
+        return Err("printed no runtime: is it the Goose compiler?".into());
     }
     Ok(info)
 }
@@ -79,9 +92,12 @@ pub const KNOWN_RUNTIMES: &[&str] = &["a5dbd11b6309"];
 /// Refuses a compiler whose runtime this bridge was not checked against,
 /// naming both, unless `allow` (a newer compiler that kept the layouts).
 pub fn check_runtime(info: &GooseInfo, lib_runtime: &str, lib_desc: &str, allow: bool) -> Result<(), String> {
-    // A compiler with the Ferrous Goose patches says so (`ferrous:` in goose
-    // version); the series changes no layout the bridge relies on.
-    let known = KNOWN_RUNTIMES.contains(&info.runtime.as_str()) || !info.features.is_empty() || info.runtime == lib_runtime;
+    // Capabilities alone do not establish layout compatibility. An explicit
+    // native ABI version does; older compilers require a known runtime hash.
+    let known = match info.native_abi {
+        Some(abi) => abi == 1,
+        None => KNOWN_RUNTIMES.contains(&info.runtime.as_str()) || info.runtime == lib_runtime,
+    };
     if known || allow {
         return Ok(());
     }

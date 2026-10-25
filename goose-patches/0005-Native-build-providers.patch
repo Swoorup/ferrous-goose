@@ -1,0 +1,392 @@
+From 7a05d1b830df219bf8f578131722e0d0985bca59 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Mon, 26 Oct 2026 00:34:25 +1100
+Subject: [PATCH] Build native libraries through external providers
+
+---
+ docs/packages.md   |  35 +++++++++++++
+ src/ast.h          |  10 +++-
+ src/capabilities.h |   2 +-
+ src/codegen_emit.h |  14 ++++++
+ src/main.cpp       |   5 ++
+ src/native.h       |  42 ++++++++++++++++
+ src/native_build.h | 119 +++++++++++++++++++++++++++++++++++++++++++++
+ src/packages.h     |  16 +++++-
+ 8 files changed, 239 insertions(+), 4 deletions(-)
+ create mode 100644 src/native_build.h
+
+diff --git a/docs/packages.md b/docs/packages.md
+index ffe04508..e2a1a4e5 100644
+--- a/docs/packages.md
++++ b/docs/packages.md
+@@ -228,6 +228,41 @@ void mylib_name(gs_rref out, int64_t id) {   /* extern fn mylib_name(out: u8[>..
+ }
+ ```
+ 
++A package may build its native library with an external provider instead:
++
++```goose
++native_build = ["my-builder", "--project", "native/project.conf"];
++```
++
++The command is an argv list, without shell expansion, run from the package
++root before its imports are parsed. Goose appends `--out-dir <package-root>`,
++`--cache-dir <build-cache>`, `--compiler <absolute-goose-path>` and
++`--include-dir <public-header-directory>`. The
++provider may generate the package's Goose module there. The language server
++reads existing generated modules and never runs providers.
++
++The provider exits successfully and prints one final report line:
++
++```
++goose-native: {"version":1,"staticlib":"/abs/libnative.a","native_libs":["-lm"],"runtime_hooks":"native_init"}
++```
++
++`staticlib` is required and must exist; a relative path is from the command's
++working directory. `native_libs` is an optional list of linker arguments.
++`runtime_hooks` optionally names a public C function taking
++`const gs_rt_hooks *`, called at program startup. The library is linked into
++`goose build`; `goose run` builds its JIT library from the same archive.
++These are build-time operations and add no per-call dispatch.
++
++Providers which must combine several packages into one archive may also
++report `combine` (an argv list) and `combine_input` (an opaque nonempty
++string). Packages with the same combiner command are combined once, with
++`--out-dir <cache>` and one `--input <string>` per package. Its report uses
++the same version, library, linker-argument and hook fields. Goose knows
++nothing about the input's language or build system; combination belongs to
++the provider. A package uses one of `c_sources`, `cmake_target` and
++`native_build`.
++
+ A package's C is self-contained: two packages that must share C share a
+ repository, as `gfx`, `audio` and `ui` do. A package whose functions keep
+ one state for the process, or that may only be called from the main thread,
+diff --git a/src/ast.h b/src/ast.h
+index 403b0eaa..f6739302 100644
+--- a/src/ast.h
++++ b/src/ast.h
+@@ -2369,8 +2369,16 @@ struct Package {
+     vector<DylibSpelling> dylibs;           // The sidecar's, by name, each once.
+     string output;                          // A program's executable, relative to its root.
+     vector<int> required;                   // The packages its files require (§4.3), by index.
++    // An external native provider supplies an archive and optional hooks.
++    vector<string> native_build;
++    string native_staticlib, native_hooks;
++    vector<string> native_libs, native_combine;
++    string native_input;
++    int native_owner = -1;
+ 
+-    bool HasNative() const { return !csources.empty() || !cmake_target.empty(); }
++    bool HasNative() const {
++        return !csources.empty() || !cmake_target.empty() || !native_staticlib.empty();
++    }
+ };
+ 
+ struct Ast {
+diff --git a/src/capabilities.h b/src/capabilities.h
+index b4a65e5c..fa473207 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
+ #pragma once
+ 
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build"
+diff --git a/src/codegen_emit.h b/src/codegen_emit.h
+index 021025c7..9255b598 100644
+--- a/src/codegen_emit.h
++++ b/src/codegen_emit.h
+@@ -895,6 +895,20 @@ inline void CodeGen::EmitProgramInit() {
+     if (!dllibs.empty())
+         Append(code, "    gs_dl_bind(gs_dllibs, ", dllibs.size(), ", gs_dlbinds, ", dlbinds,
+                ");\n");
++    // Statically linked providers opt into hooks by naming their initializer.
++    set<string> nativehooks;
++    auto addhooks = [&](int pkg) {
++        if (ast.packages[pkg].native_owner >= 0) pkg = ast.packages[pkg].native_owner;
++        auto &hook = ast.packages[pkg].native_hooks;
++        if (!hook.empty()) nativehooks.insert(hook);
++    };
++    if (!ast.packages.empty()) addhooks(0);
++    for (auto sp : usedexterns)
++        if (sp->sf->dylib.empty()) addhooks(ast.filepkg[sp->sf->line.fileidx]);
++    for (auto &hook : nativehooks) {
++        Append(data, "void ", hook, "(const gs_rt_hooks *);\n");
++        Append(code, "    gs_rt_give_hooks(", hook, ");\n");
++    }
+     // The queues, before anything that could use one runs.
+     vector<string> qnames;
+     for (auto &[m, q] : queues) qnames.push_back(q);
+diff --git a/src/main.cpp b/src/main.cpp
+index 0fd1b18b..705e0086 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -50,6 +50,7 @@
+ #include "builtin.h"
+ #include "build.h"
+ #include "packages.h"
++#include "native_build.h"
+ #include "native.h"
+ #include "lsp_rpc.h"
+ #include "lsp_analysis.h"
+@@ -1290,10 +1291,14 @@ int Main(int argc, char **argv) {
+         auto &ast = *astp;
+         if (jsondiag) ast.sink = [&](const Diagnostic &d) { found.push_back(d); };
+         auto stdlibdirs = StdlibDirs(stdlibdir, exe);
++        // Run external native providers while sidecars load.
++        NativeBuildsAllowed() = !parseonly;
++        GooseExePath() = ForwardSlashes(AbsolutePath(exe));
+         ParseProgram(ast, filename, stdlibdirs, DirOf(exe));
+         // The parser reported what it recovered from as it went; nothing
+         // further is asked of a program with a syntax error.
+         if (!ast.errors.empty()) return 1;
++        CombineNativeLibraries(ast);
+         if (dumpdocs) {
+             string s;
+             DumpDocs(ast, s);
+diff --git a/src/native.h b/src/native.h
+index 00cdeccf..579aec10 100644
+--- a/src/native.h
++++ b/src/native.h
+@@ -18,6 +18,8 @@ inline vector<int> NativePackagesUsed(const Ast &ast, const vector<FnSpec *> &us
+         // One bound from a shared library at run time comes from no package's C.
+         if (!sp->sf->dylib.empty()) continue;
+         auto pkg = ast.filepkg[sp->sf->line.fileidx];
++        // A provider's library may hold several packages.
++        if (ast.packages[pkg].native_owner >= 0) pkg = ast.packages[pkg].native_owner;
+         if (ast.packages[pkg].HasNative()) needed.insert(pkg);
+     }
+     // A package's depth is one more than the deepest it requires; deeper
+@@ -471,12 +473,23 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+     // is as the command line named the program, and a build that named it
+     // another way is the same build.
+     auto inputs = p.csources;
++    if (!p.native_staticlib.empty()) inputs.push_back(p.native_staticlib);
+     inputs.push_back(ForwardSlashes(AbsolutePath(p.sidecar)));
+     string sidecartext;
+     LoadFile(p.sidecar, sidecartext);
+     // The JIT library's symbol table names every extern fn, so a new one
+     // rebuilds it.
+     auto externs = PackageExternNames(ast, pkg);
++    // Combined native libraries bring their other packages' functions.
++    for (size_t other = 0; other < ast.packages.size(); other++)
++        if (ast.packages[other].native_owner == pkg)
++            for (auto &n : PackageExternNames(ast, (int)other))
++                if (std::find(externs.begin(), externs.end(), n) == externs.end()) externs.push_back(n);
++    // A provider's optional runtime hooks, handed the runtime's hooks as
++    // it starts (CodeGen::EmitProgramInit).
++    if (!p.native_hooks.empty() &&
++        std::find(externs.begin(), externs.end(), p.native_hooks) == externs.end())
++        externs.push_back(p.native_hooks);
+     string externtext;
+     for (auto &n : externs) Append(externtext, n, "\n");
+     // The stamp: what the build was made from, then whether it holds the
+@@ -514,6 +527,35 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+         if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
+         return true;
+     }
++    if (!p.native_staticlib.empty()) {
++        // The provider's static library and additional linker arguments it
++        // needs, as a link takes them.
++        auto msvcstyle = b.tc.style == "msvc";
++        string rsp;
++        Append(rsp, msvcstyle ? "" : "\"", p.native_staticlib, msvcstyle ? "" : "\"", "\n");
++        for (auto &l : p.native_libs) Append(rsp, l, "\n");
++        if (!b.opts.dryrun && !WriteFileIfChanged(out.rsp, rsp))
++            throw CompileError { cat("cannot write ", out.rsp) };
++        if (wantjit) {
++            auto symsrc = cat(dir, "/goose_symbols.c");
++            auto symobj = cat(dir, msvcstyle ? "/goose_symbols.obj" : "/goose_symbols.o");
++            if (!b.opts.dryrun && !WriteFileMakingDirs(symsrc, SymbolTableSource(p.name, externs)))
++                throw CompileError { cat("cannot write ", symsrc) };
++            vector<string> symflags = { msvcstyle ? "/w" : "-w" };
++            #ifndef _WIN32
++                if (!msvcstyle) symflags.push_back("-fPIC");
++            #endif
++            if (!b.CompileObject(symsrc, symobj, cat("compiling the symbol table of the package ", p.name),
++                                 cat(dir, "/goose_symbols.cc.log"), symflags))
++                return false;
++            if (!b.LinkShared({ symobj, p.native_staticlib }, p.native_libs, out.jitlib, dir,
++                              cat(dir, "/jit.cc.log"),
++                              cat("building the package ", p.name, "'s library for the JIT")))
++                return false;
++        }
++        if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
++        return true;
++    }
+     // Where only the JIT library is missing, the objects already made from
+     // these inputs serve as they are: a link in another process may be
+     // reading them.
+diff --git a/src/native_build.h b/src/native_build.h
+new file mode 100644
+index 00000000..536f8cb9
+--- /dev/null
++++ b/src/native_build.h
+@@ -0,0 +1,119 @@
++// Native build providers: an argv command produces a library and optional
++// source modules. The compiler knows the protocol, not the provider's tools.
++#pragma once
++
++namespace goose {
++
++inline bool &NativeBuildsAllowed() { static bool allowed = false; return allowed; }
++inline string &GooseExePath() { static string exe; return exe; }
++
++inline vector<string> NativeStrings(const Json &j, const string &key) {
++    vector<string> out;
++    auto v = j.Get(key);
++    if (!v) return out;
++    if (v->kind != Json::ARRAY) throw CompileError { cat("native build: ", key, " must be a string list") };
++    for (auto &e : v->arr) {
++        if (e.kind != Json::STRING || e.str.empty())
++            throw CompileError { cat("native build: ", key, " must contain nonempty strings") };
++        out.push_back(e.str);
++    }
++    return out;
++}
++
++inline bool NativeHookName(const string &s) {
++    if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
++    for (auto c : s) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
++    // Keep the runtime's and generated program's symbol namespace private.
++    return !IsCKeyword(s) && s != "main" && s != "goose_init" && s.compare(0, 3, "gs_") != 0;
++}
++
++inline Json NativeBuildReport(const vector<string> &argv, const string &cwd) {
++    auto r = RunProcess(argv, cwd);
++    if (!r.started || r.code != 0)
++        throw CompileError { cat("native build failed in ", cwd, ":\n", r.output) };
++    auto at = r.output.rfind("goose-native: ");
++    if (at == string::npos)
++        throw CompileError { cat("native builder printed no goose-native report:\n", r.output) };
++    auto line = r.output.substr(at + 14);
++    auto j = ParseJson(line.substr(0, line.find('\n')));
++    auto version = j.Get("version");
++    if (j.kind != Json::OBJECT || !version || version->kind != Json::NUMBER || version->num != 1)
++        throw CompileError { "native build report needs protocol version 1" };
++    return j;
++}
++
++inline void ReadNativeLibrary(Package &pkg, const Json &j, const string &cwd) {
++    auto lib = j.Str("staticlib");
++    if (lib.empty()) throw CompileError { "native build report needs a staticlib" };
++    pkg.native_staticlib = IsAbsoluteSource(lib) ? lib : ForwardSlashes(AbsolutePath(cat(cwd, "/", lib)));
++    if (!PathExists(pkg.native_staticlib))
++        throw CompileError { cat("native builder reported a missing library: ", pkg.native_staticlib) };
++    pkg.native_libs = NativeStrings(j, "native_libs");
++    auto hooks = j.Get("runtime_hooks");
++    if (hooks && hooks->kind != Json::STRING)
++        throw CompileError { "native build runtime_hooks must be a public C identifier" };
++    pkg.native_hooks = j.Str("runtime_hooks");
++    if (!pkg.native_hooks.empty() && !NativeHookName(pkg.native_hooks))
++        throw CompileError { "native build runtime_hooks must be a public C identifier" };
++}
++
++inline void BuildNativeLibrary(Package &pkg) {
++    if (pkg.native_build.empty() || !NativeBuildsAllowed()) return;
++    auto cwd = ForwardSlashes(AbsolutePath(pkg.root.empty() ? "." : pkg.root));
++    auto cache = ForwardSlashes(AbsolutePath(cat(GooseHome(), "/build/native/",
++                          pkg.cachekey.empty() ? Hex8(cwd) : pkg.cachekey)));
++    auto includes = cat(cache, "/include");
++    for (auto &rf : runtime_files)
++        if (string_view(rf.name) == "goose.h" && !WriteFileMakingDirs(cat(includes, "/goose.h"), string(rf.text)))
++            throw CompileError { "cannot write the native builder header" };
++    vector<string> argv = pkg.native_build;
++    for (auto &a : vector<string> { "--out-dir", cwd, "--cache-dir", cache,
++                                   "--compiler", GooseExePath(), "--include-dir", includes }) argv.push_back(a);
++    ProgressStep step(cat("building the package ", pkg.name, "'s native library"), true);
++    auto j = NativeBuildReport(argv, cwd);
++    ReadNativeLibrary(pkg, j, cwd);
++    // Providers which need one library for several packages opt into a
++    // combiner. Its command is the group key; each input is opaque to Goose.
++    pkg.native_combine = NativeStrings(j, "combine");
++    pkg.native_input = j.Str("combine_input");
++    if (pkg.native_combine.empty() != pkg.native_input.empty())
++        throw CompileError { "native build needs both combine and combine_input, or neither" };
++    if (!pkg.native_combine.empty()) {
++        auto &exe = pkg.native_combine[0];
++        if (!IsAbsoluteSource(exe) && (exe.find('/') != string::npos || exe.find('\\') != string::npos))
++            exe = ForwardSlashes(AbsolutePath(cat(cwd, "/", exe)));
++    }
++}
++
++inline void CombineNativeLibraries(Ast &ast) {
++    if (!NativeBuildsAllowed()) return;
++    map<vector<string>, vector<int>> groups;
++    for (size_t i = 0; i < ast.packages.size(); i++) {
++        auto &p = ast.packages[i];
++        if (!p.native_combine.empty()) groups[p.native_combine].push_back((int)i);
++    }
++    for (auto &[command, pkgs] : groups) {
++        if (pkgs.size() < 2) continue;
++        string key;
++        for (auto &a : command) Append(key, a.size(), ":", a);
++        for (auto i : pkgs) Append(key, ast.packages[i].native_input.size(), ":", ast.packages[i].native_input);
++        auto cwd = ForwardSlashes(AbsolutePath("."));
++        auto outdir = ForwardSlashes(AbsolutePath(cat(GooseHome(), "/build/native/combined-", Hex8(key))));
++        auto argv = command;
++        argv.push_back("--out-dir"); argv.push_back(outdir);
++        for (auto i : pkgs) {
++            argv.push_back("--input"); argv.push_back(ast.packages[i].native_input);
++        }
++        ProgressStep step(cat("combining ", pkgs.size(), " native libraries"), true);
++        auto j = NativeBuildReport(argv, cwd);
++        ReadNativeLibrary(ast.packages[pkgs[0]], j, cwd);
++        for (size_t k = 1; k < pkgs.size(); k++) {
++            auto &p = ast.packages[pkgs[k]];
++            p.native_owner = pkgs[0];
++            p.native_staticlib.clear();
++            p.native_hooks.clear();
++        }
++    }
++}
++
++}  // namespace goose
+diff --git a/src/packages.h b/src/packages.h
+index d8dabdb2..f5183b81 100644
+--- a/src/packages.h
++++ b/src/packages.h
+@@ -126,13 +126,16 @@ inline string GitCacheDir(const PackageSource &s) {
+ // own; and for the program its executable's name. Lists take a _windows,
+ // _linux or _macos suffix for a platform's own part. Paths are relative to
+ // the package root.
++void BuildNativeLibrary(Package &pkg);
++
+ inline void LoadSidecar(Package &pkg, bool isprogram) {
+     pkg.sidecar = cat(pkg.root, pkg.name, ".build");
+     auto bf = LoadBuildFile(pkg.sidecar, pkg.hassidecar);
+     if (!pkg.hassidecar) return;
+     const char *lists[] = { "c_sources", "c_include", "c_defines", "c_flags_cc", "c_flags_msvc",
+                             "c_libs", "dylibs" };
+-    vector<string> known = { "cmake_target", "cmake_options", "main_thread_only", "exclude" };
++    vector<string> known = { "cmake_target", "cmake_options", "main_thread_only", "exclude",
++                             "native_build" };
+     for (auto key : lists)
+         for (auto suffix : { "", "_windows", "_linux", "_macos" }) known.push_back(cat(key, suffix));
+     if (isprogram) known.push_back("output");
+@@ -186,6 +189,14 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+     }
+     if (!pkg.csources.empty() && !pkg.cmake_target.empty())
+         throw CompileError { cat(pkg.sidecar, ": a package has either c_sources or a cmake_target") };
++    pkg.native_build = bf.Strings("native_build");
++    if (!pkg.native_build.empty()) {
++        if (!pkg.csources.empty() || !pkg.cmake_target.empty())
++            throw CompileError { cat(pkg.sidecar, ": a package has one of c_sources, cmake_target and native_build") };
++        for (auto &arg : pkg.native_build)
++            if (arg.empty()) throw CompileError { cat(pkg.sidecar, ": native_build needs nonempty arguments") };
++        BuildNativeLibrary(pkg);
++    }
+ }
+ 
+ // Removes a directory tree. A git checkout holds read-only files, which
+@@ -317,7 +328,8 @@ inline string PackageRoot(const PackageSource &source, const string &name) {
+     } else {
+         dir = FetchPackage(source, name);
+     }
+-    if (!PathExists(cat(dir, name, ".goose")))
++    // An external provider may generate the entry as its sidecar loads.
++    if (!PathExists(cat(dir, name, ".goose")) && !PathExists(cat(dir, name, ".build")))
+         throw CompileError { cat("the package ", name, " at ", dir, " has no ", name, ".goose") };
+     return dir;
+ }
