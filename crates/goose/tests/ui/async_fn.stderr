@@ -1,0 +1,5 @@
+error: goose::export: async functions cannot cross; Goose has no futures
+ --> tests/ui/async_fn.rs:2:5
+  |
+2 | pub async fn later() -> i64 {
+  |     ^^^^^

@@ -1,0 +1,457 @@
+From 5c6da17b89b953dc0e9e8db45af56727a93c0025 Mon Sep 17 00:00:00 2001
+From: Ferrous Goose <ferrous@goose.invalid>
+Date: Sun, 25 Oct 2026 19:52:35 +1100
+Subject: [PATCH 7/8] align n for structs and enums (Ferrous Goose 0007)
+
+Every value of an aligned type lives at a multiple of n: its C type is
+aligned and a growable array of such values starts at an aligned stack top.
+An aligned enum's tag takes n bytes, so its payload starts at n, the layout
+of a Rust #[repr(C, u8)] enum.
+---
+ docs/goose_spec.md      | 13 +++++++
+ src/ast.h               |  7 ++++
+ src/codegen.h           | 11 +++++-
+ src/codegen_construct.h |  1 +
+ src/codegen_emit.h      |  1 +
+ src/codegen_stmts.h     |  1 +
+ src/codegen_types.h     | 75 ++++++++++++++++++++++++++++++++++++++---
+ src/codegen_values.h    |  1 +
+ src/ferrous.h           |  2 +-
+ src/interface.h         |  5 +--
+ src/parser.h            | 36 ++++++++++++++++++--
+ src/runtime/runtime.h   |  9 +++++
+ src/runtime_inline.h    | 21 ++++++++----
+ 13 files changed, 167 insertions(+), 16 deletions(-)
+
+diff --git a/docs/goose_spec.md b/docs/goose_spec.md
+index 7c1d990d..509c85b1 100644
+--- a/docs/goose_spec.md
++++ b/docs/goose_spec.md
+@@ -265,6 +265,19 @@ struct X { a: i8[3], b: i32, c: i64 = 0 }
+   tail padding is added. In variable-class layouts (where offsets are dynamic)
+   `pad n` still inserts n bytes, but bare `pad` has no defined alignment to
+   aim for and inserts nothing.
++* `align n` among a struct's fields (n a power of two up to 64), or among an
++  enum's variants (up to 8), places every value of the type at an address
++  that is a multiple of n: in a variable, as an element of a fixed or
++  growable array, and on a data stack, whose top a growable array of such
++  values starts at is rounded up. It makes the type's C type aligned too, so
++  a value lent to C code compiled against an aligned struct (a Rust
++  `#[repr(C)]` one, say) is aligned as that code assumes. It adds no padding:
++  the type's size must already be a multiple of n, each field of an aligned
++  type must sit at a multiple of its own alignment in a type at least as
++  aligned, and an aligned type is at most 4096 bytes and is no element of a
++  limited or variable array, whose length goes before the elements. An
++  aligned enum's tag takes n bytes, so its payload starts at n: the layout of
++  a Rust `#[repr(C, u8)]` enum, given the same pads. Ferrous Goose 0007.
+ * Fields are mutable by default; `let` before a field name means the field
+   is not assigned after construction (§4.4), and `const f: T` is `let f:
+   const T`: its contents are read-only too (§9.5).
+diff --git a/src/ast.h b/src/ast.h
+index 61578de8..58bbc69e 100644
+--- a/src/ast.h
++++ b/src/ast.h
+@@ -1496,6 +1496,10 @@ struct SStruct {
+     string_view name;
+     string_view ns;             // As SFunction::ns / qname.
+     string_view qname;
++    // `align n` (Ferrous Goose 0007): every value of the type lives at an
++    // address that is a multiple of n, in a variable, an element or on a
++    // data stack; 1 for none.
++    int64_t align = 1;
+     Line line;
+     Line end;                   // As SFunction::end.
+     string_view doc;            // As SFunction::doc.
+@@ -1526,6 +1530,9 @@ struct SEnum {
+     string_view name;
+     string_view ns;             // As SFunction::ns / qname.
+     string_view qname;
++    // `align n` (Ferrous Goose 0007): as SStruct::align, and the tag takes n
++    // bytes, so the payload starts at n.
++    int64_t align = 1;
+     Line line;
+     Line end;                   // As SFunction::end.
+     string_view doc;            // As SFunction::doc.
+diff --git a/src/codegen.h b/src/codegen.h
+index 26dd84eb..9ad7e28e 100644
+--- a/src/codegen.h
++++ b/src/codegen.h
+@@ -311,7 +311,16 @@ struct CodeGen {
+     static const char *RelCT(IntStorage s, bool uns = false);
+     static const char *RelCT(TypeExpr *rt);
+ 
+-    IntStorage TagStore(SEnum *en) { return en->variants.size() <= 256 ? IS_U8 : IS_U16; }
++    IntStorage TagStore(SEnum *en) {
++        // An aligned enum's tag fills the alignment, so the payload starts
++        // aligned (Ferrous Goose 0007).
++        if (en->align >= 8) return IS_U64;
++        if (en->align == 4) return IS_U32;
++        if (en->align == 2 || en->variants.size() > 256) return IS_U16;
++        return IS_U8;
++    }
++    int64_t AlignOf(TypeExpr *t);
++    void AlignTop(const string &stk, TypeExpr *elem);
+     int64_t TagSize(SEnum *en) { return IntSize(TagStore(en)); }
+ 
+     // Packed layout of a run of fields: byte offsets aligned with the fields
+diff --git a/src/codegen_construct.h b/src/codegen_construct.h
+index 994ef40d..9403c68f 100644
+--- a/src/codegen_construct.h
++++ b/src/codegen_construct.h
+@@ -1293,6 +1293,7 @@ inline void CodeGen::GenFrameObjLit(StructLit *sl, StructInst *si, const string
+             if (IsFrameObj(ft)) {
+                 GenConstruct(init, stk, ft, flv);
+             } else {
++                if (ft->kind == TY_ARRAY) AlignTop(stk, ft->arr->sub);
+                 L(flv, ".base = ", Top(stk), ";");
+                 L(flv, ".len = 0;");
+                 GenConstruct(init, stk, ft, cat(flv, ".len"));
+diff --git a/src/codegen_emit.h b/src/codegen_emit.h
+index 525ff134..50d4aac9 100644
+--- a/src/codegen_emit.h
++++ b/src/codegen_emit.h
+@@ -851,6 +851,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
+     if (IsResz(d->type) && IsFrameObj(d->type)) {
+         // The tail header is set when the value is constructed.
+     } else if (IsResz(d->type)) {
++        if (d->type->kind == TY_ARRAY) AlignTop(stk, d->type->arr->sub);
+         L(gnames[d], ".base = ", Top(stk), ";");
+         L(gnames[d], ".len = 0;");
+     } else {
+diff --git a/src/codegen_stmts.h b/src/codegen_stmts.h
+index 8e4fbef6..f4ac5866 100644
+--- a/src/codegen_stmts.h
++++ b/src/codegen_stmts.h
+@@ -759,6 +759,7 @@ inline Dst CodeGen::DeclStackLocal(VarDef *d, bool forlocal) {
+         if (own) SaveBase(forlocal, stk, cat(FoTailHdr(t, name), ".base"));
+         return Dst { DK_STACK, stk, t, name };
+     }
++    if (t->kind == TY_ARRAY) AlignTop(stk, t->arr->sub);
+     L("gs_rhdr ", name, " = { ", Top(stk), ", 0 };");
+     if (own) SaveBase(forlocal, stk, cat(name, ".base"));
+     if (d->reusable) {
+diff --git a/src/codegen_types.h b/src/codegen_types.h
+index e42fd637..1ccc9046 100644
+--- a/src/codegen_types.h
++++ b/src/codegen_types.h
+@@ -240,8 +240,27 @@ inline const char *CodeGen::RelCT(TypeExpr *rt) {
+ // StructInst / (EnumInst, variant).
+ 
+ // The alignment `pad` (bare form) gives the next field: its scalar width.
++// The alignment `align n` gives a type's values (Ferrous Goose 0007): its
++// own, or its elements' for a fixed array; 1 for everything else.
++inline int64_t CodeGen::AlignOf(TypeExpr *t) {
++    switch (t->kind) {
++        case TY_STRUCT: return t->struc->st->align;
++        case TY_ENUM: return t->enu->varmode ? 1 : t->enu->en->align;
++        case TY_ARRAY: return t->arr->akind == A_FIXED ? AlignOf(t->arr->sub) : 1;
++        default: return 1;
++    }
++}
++
++// Rounds a data stack's top up to the alignment of the elements about to be
++// placed at it, where they have one.
++inline void CodeGen::AlignTop(const string &stk, TypeExpr *elem) {
++    auto a = AlignOf(elem);
++    if (a > 1) L(TopW(stk), " = GS_ALIGN_UP(", Top(stk), ", ", a, ");");
++}
++
+ inline int64_t CodeGen::PadAlign(TypeExpr *t) {
+     switch (t->kind) {
++        case TY_STRUCT: case TY_ENUM: return AlignOf(t);
+         case TY_INT: return t->intstorage == IS_VARINT ? 1 : IntSize(t->intstorage);
+         case TY_FLT: return t->fltstorage == FS_F32 ? 4 : 8;
+         case TY_REF: return t->ref->lenstorage >= 0 ?
+@@ -280,18 +299,51 @@ inline CodeGen::Layout CodeGen::LayoutFields(const vector<Field> &fields,
+     return lo;
+ }
+ 
++// An aligned field must sit at a multiple of its alignment in a container
++// at least as aligned, `base` bytes into it (an enum's payload), and an
++// aligned type's size must be a multiple of its alignment, so that its
++// elements stay aligned too (Ferrous Goose 0007).
++inline void CheckAlignedLayout(CodeGen &cg, string_view what, Line line, int64_t align, int64_t base,
++                               const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
++                               const CodeGen::Layout &lo) {
++    for (size_t i = 0; i < fields.size(); i++) {
++        if (fields[i].ispad || !ftypes[i]) continue;
++        auto fa = cg.AlignOf(ftypes[i]);
++        if (fa <= 1) continue;
++        if (align < fa)
++            cg.Fail(fields[i].line, cat(what, ": field ", fields[i].name, " is aligned to ", fa,
++                                        ", which needs `align ", fa, "` (or more) on ", what));
++        if ((base + lo.offs[i]) % fa)
++            cg.Fail(fields[i].line, cat(what, ": field ", fields[i].name, " at offset ", base + lo.offs[i],
++                                        " is not a multiple of its alignment ", fa, ": add a pad before it"));
++    }
++    (void)line;
++}
++
+ inline const CodeGen::Layout &CodeGen::StructLayout(StructInst *si) {
+     auto key = pair<const void *, int>(si, -1);
+     auto it = layouts.find(key);
+     if (it != layouts.end()) return it->second;
+-    return layouts[key] = LayoutFields(si->st->fields, si->ftypes);
++    auto &lo = layouts[key] = LayoutFields(si->st->fields, si->ftypes);
++    auto a = si->st->align;
++    CheckAlignedLayout(*this, cat("struct ", si->st->qname), si->st->line, a, 0, si->st->fields, si->ftypes, lo);
++    if (a > 1 && lo.size % a)
++        Fail(si->st->line, cat("struct ", si->st->qname, " has align ", a, " but is ", lo.size,
++                               " bytes: add pad ", a - lo.size % a, " so its elements stay aligned"));
++    if (a > 1 && lo.size > 4096)
++        Fail(si->st->line, cat("struct ", si->st->qname, ": an aligned struct is at most 4096 bytes"));
++    return lo;
+ }
+ 
+ inline const CodeGen::Layout &CodeGen::VariantLayout(EnumInst *ei, int vi) {
+     auto key = pair<const void *, int>(ei, vi);
+     auto it = layouts.find(key);
+     if (it != layouts.end()) return it->second;
+-    return layouts[key] = LayoutFields(ei->en->variants[vi].fields, ei->vftypes[vi]);
++    auto &lo = layouts[key] = LayoutFields(ei->en->variants[vi].fields, ei->vftypes[vi]);
++    CheckAlignedLayout(*this, cat("enum ", ei->en->qname), ei->en->line, ei->en->align,
++                       ei->en->align > 1 ? ei->en->align : 0, ei->en->variants[vi].fields,
++                       ei->vftypes[vi], lo);
++    return lo;
+ }
+ 
+ inline int64_t CodeGen::FixedSize(TypeExpr *t) {
+@@ -317,6 +369,11 @@ inline int64_t CodeGen::FixedSize(TypeExpr *t) {
+             int64_t maxp = 0;
+             for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+                 maxp = std::max(maxp, VariantLayout(ei, (int)vi).size);
++            auto a = ei->en->align;
++            if (a > 1 && (TagSize(ei->en) + maxp) % a)
++                Fail(ei->en->line, cat("enum ", ei->en->qname, " has align ", a, " but is ",
++                                       TagSize(ei->en) + maxp, " bytes: pad its largest variant to ",
++                                       (maxp + a - 1) / a * a, " bytes so its elements stay aligned"));
+             return TagSize(ei->en) + maxp;
+         }
+         case TY_VARIANT: {
+@@ -574,6 +631,9 @@ inline string CodeGen::CT(TypeExpr *t) {
+                 Append(d, "typedef struct { ", e, " e[", k ? k : 1, "]; } ", name, ";\n");
+             } else {
+                 assert(a.akind == A_LIMITED && ArrSize(t->arr) >= 0);
++                if (AlignOf(a.sub) > 1)
++                    Fail(t->line, cat("a limited array's length goes before its elements, which leaves ",
++                                      "elements of an aligned type unaligned: use a fixed or growable array"));
+                 Append(d, "typedef struct { ", IntCT(LenStore(t->arr)), " len; ", e, " e[",
+                        ArrSize(t->arr) ? ArrSize(t->arr) : 1, "]; } ", name, ";\n");
+             }
+@@ -581,7 +641,9 @@ inline string CodeGen::CT(TypeExpr *t) {
+         }
+         case TY_STRUCT: {
+             auto si = SI(t);
+-            Append(d, "struct ", name, " {\n");
++            StructLayout(si);   // Its alignment rules first.
++            if (si->st->align > 1) Append(d, "struct GS_ALIGNED(", si->st->align, ") ", name, " {\n");
++            else Append(d, "struct ", name, " {\n");
+             if (EmptyLayout(si->st->fields)) Append(d, "    uint8_t gs_empty;\n");
+             else EmitCFields(d, si->st->fields, si->ftypes);
+             Append(d, "};\n");
+@@ -601,7 +663,12 @@ inline string CodeGen::CT(TypeExpr *t) {
+             assert(!t->enu->varmode);
+             auto ei = EIOf(t);
+             EnsureTagEnum(ei);
+-            Append(d, "struct ", name, " {\n    ", IntCT(TagStore(ei->en)), " tag;\n");
++            FixedSize(t);   // Its alignment rules first.
++            if (ei->en->align > 1)
++                Append(d, "struct GS_ALIGNED(", ei->en->align, ") ", name, " {\n    ",
++                       IntCT(TagStore(ei->en)), " tag;\n");
++            else
++                Append(d, "struct ", name, " {\n    ", IntCT(TagStore(ei->en)), " tag;\n");
+             string members;
+             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                 if (EmptyLayout(ei->en->variants[vi].fields)) continue;
+diff --git a/src/codegen_values.h b/src/codegen_values.h
+index 9dfa43c8..87ac3ab5 100644
+--- a/src/codegen_values.h
++++ b/src/codegen_values.h
+@@ -856,6 +856,7 @@ inline string CodeGen::RzTemp(TypeExpr *t, string &stk) {
+         L(CT(t), " ", h, ";");
+         SaveBase(false, stk, cat(FoTailHdr(t, h), ".base"));
+     } else {
++        if (t->kind == TY_ARRAY) AlignTop(stk, t->arr->sub);
+         L("gs_rhdr ", h, " = { ", Top(stk), ", 0 };");
+         SaveBase(false, stk, cat(h, ".base"));
+     }
+diff --git a/src/ferrous.h b/src/ferrous.h
+index 96ecb1ad..f0fd8cf2 100644
+--- a/src/ferrous.h
++++ b/src/ferrous.h
+@@ -3,4 +3,4 @@
+ // lists so that cargo goose and goose_build know what the compiler can do.
+ #pragma once
+ 
+-#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs"
++#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs align"
+diff --git a/src/interface.h b/src/interface.h
+index 6c36303f..d03b0847 100644
+--- a/src/interface.h
++++ b/src/interface.h
+@@ -171,7 +171,8 @@ struct InterfaceWriter {
+                 JsonQuote(out, si->st->qname);
+                 out += ",\"doc\":";
+                 JsonQuote(out, si->st->doc);
+-                Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"fields\":");
++                Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"align\":", si->st->align,
++                       ",\"fields\":");
+                 Fields(si->st->fields, si->ftypes, lo);
+                 out += "}";
+                 if (types.back() != '[') types += ",";
+@@ -192,7 +193,7 @@ struct InterfaceWriter {
+             out += ",\"doc\":";
+             JsonQuote(out, ei->en->doc);
+             Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
+-                   ",\"variants\":[");
++                   ",\"align\":", ei->en->align, ",\"variants\":[");
+             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                 if (vi) out += ",";
+                 auto &v = ei->en->variants[vi];
+diff --git a/src/parser.h b/src/parser.h
+index 25400ee2..2e150dde 100644
+--- a/src/parser.h
++++ b/src/parser.h
+@@ -533,7 +533,7 @@ struct Parser {
+         ParseMembers(st->broken, depth, startp, [&](Ast::DeclMark &kept) {
+             ParseGenerics(st->generics, &kept);
+             Expect(T_LCURLY, "struct declaration");
+-            ParseFieldList(st->fields, "struct body", &kept);
++            ParseFieldList(st->fields, "struct body", &kept, &st->align);
+             Expect(T_RCURLY, "struct declaration");
+         });
+         st->end = PrevEnd();
+@@ -542,10 +542,37 @@ struct Parser {
+         ast.topdecls.push_back(Finish(New<StructDecl>(line, st)));
+     }
+ 
++    // `align n` where a member may go (Ferrous Goose 0007): an identifier
++    // `align` followed by an integer, which a field named align (followed by
++    // `:`) is not. Sets `*align`, or is an error where none is given (a
++    // variant's fields). True when it was one.
++    bool ParseAlign(int64_t *align, const char *context) {
++        if (lex.tok != T_IDENT || lex.attr != "align") return false;
++        auto save = lex;
++        lex.Next();
++        if (lex.tok != T_INTLIT) {
++            lex = save;
++            return false;
++        }
++        auto n = lex.ival;
++        if (!align) Error(cat("align goes among a struct's fields or an enum's variants, not in a ", context));
++        if (n < 1 || n > 64 || (n & (n - 1)))
++            Error(cat("align ", n, ": the alignment is a power of two from 1 to 64"));
++        if (*align != 1) Error("align is given twice");
++        *align = n;
++        lex.Next();
++        return true;
++    }
++
+     // `kept`, where given, is moved past each whole field (ParseMembers).
+     void ParseFieldList(vector<Field> &fields, const char *context,
+-                        Ast::DeclMark *kept = nullptr) {
++                        Ast::DeclMark *kept = nullptr, int64_t *align = nullptr) {
+         while (lex.tok != T_RCURLY) {
++            if (ParseAlign(align, context)) {
++                KeepMember(kept);
++                if (!IsNext(T_COMMA)) break;
++                continue;
++            }
+             Field f;
+             f.line = CurLine();
+             f.doc = lex.doc;
+@@ -594,6 +621,11 @@ struct Parser {
+             ParseGenerics(en->generics, &kept);
+             Expect(T_LCURLY, "enum declaration");
+             while (lex.tok != T_RCURLY) {
++                if (ParseAlign(&en->align, "enum")) {
++                    if (en->align > 8) Error("an enum's align is at most 8, the widest tag");
++                    if (!IsNext(T_COMMA)) break;
++                    continue;
++                }
+                 SVariant v;
+                 v.line = CurLine();
+                 v.doc = lex.doc;
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 876788fc..6c1c118d 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -830,6 +830,15 @@ typedef struct {
+    gets nothing more. */
+ #define GOOSE_H 1
+ 
++/* `align n` (Ferrous Goose 0007): the C type of an aligned struct or enum,
++   and a data stack top rounded up for its elements. */
++#if defined(_MSC_VER) && !defined(__clang__)
++#define GS_ALIGNED(n) __declspec(align(n))
++#else
++#define GS_ALIGNED(n) __attribute__((aligned(n)))
++#endif
++#define GS_ALIGN_UP(p, n) ((uint8_t *)(((uintptr_t)(p) + ((uintptr_t)(n) - 1)) & ~((uintptr_t)(n) - 1)))
++
+ /* Starts the runtime on main's thread: the program's arguments, each
+    region's usable reservation and trailing guard gap, the address space
+    budgeted for regions over the whole program, and the most regions the
+diff --git a/src/runtime_inline.h b/src/runtime_inline.h
+index eb4d05c2..883a159d 100644
+--- a/src/runtime_inline.h
++++ b/src/runtime_inline.h
+@@ -846,6 +846,15 @@ typedef struct {
+    gets nothing more. */
+ #define GOOSE_H 1
+ 
++/* `align n` (Ferrous Goose 0007): the C type of an aligned struct or enum,
++   and a data stack top rounded up for its elements. */
++#if defined(_MSC_VER) && !defined(__clang__)
++#define GS_ALIGNED(n) __declspec(align(n))
++#else
++#define GS_ALIGNED(n) __attribute__((aligned(n)))
++#endif
++#define GS_ALIGN_UP(p, n) ((uint8_t *)(((uintptr_t)(p) + ((uintptr_t)(n) - 1)) & ~((uintptr_t)(n) - 1)))
++
+ /* Starts the runtime on main's thread: the program's arguments, each
+    region's usable reservation and trailing guard gap, the address space
+    budgeted for regions over the whole program, and the most regions the
+@@ -881,7 +890,8 @@ typedef struct gs_dlbind {
+     void **slot;
+ } gs_dlbind;
+ /* Opens each library once and fills every slot, on the main thread before
+-   the globals are initialized. A library that does not load, or a symbol it
++)GSRT"
++R"GSRT(   the globals are initialized. A library that does not load, or a symbol it
+    does not have, is a runtime error naming both. */
+ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *binds,
+                        int64_t nbinds);
+@@ -889,8 +899,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+ /* ---------------------------------------------------------------------------
+    Threads and typed queues (§11.2), runtime_threads.h. */
+ 
+-)GSRT"
+-R"GSRT(GS_API int64_t gs_hardware_threads(void);
++GS_API int64_t gs_hardware_threads(void);
+ /* Runs run(entry, args) and then release() on a new thread, args a copy of
+    argsize bytes, and returns the worker's id. In a contained worker an
+    abort ends run early. */
+@@ -1074,7 +1083,8 @@ static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
+     return (int64_t)(q - p);
+ }
+ 
+-static int64_t gs_zig_read(const uint8_t *p) {
++)GSRT"
++R"GSRT(static int64_t gs_zig_read(const uint8_t *p) {
+     uint64_t u = (uint64_t)gs_uleb_read(p);
+     return (int64_t)((u >> 1) ^ (0u - (u & 1)));
+ }
+@@ -1085,8 +1095,7 @@ static int64_t gs_zig_write(uint8_t *p, int64_t v) {
+ 
+ /* ---------------------------------------------------------------------------
+    Verified loading (docs/design/serialization.md): what the generated
+-)GSRT"
+-R"GSRT(   gs_verify_<T> walkers are built from. The bytes are untrusted until the
++   gs_verify_<T> walkers are built from. The bytes are untrusted until the
+    walk finishes, so every read here is bounded by the image end and reports
+    a malformed encoding instead of running past it. */
+ 
+-- 
+2.54.0
+

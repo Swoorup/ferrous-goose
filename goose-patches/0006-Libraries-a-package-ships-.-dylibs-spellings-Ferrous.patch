@@ -1,0 +1,103 @@
+From feb48836e7b347d0921efaa79efb7b327a765309 Mon Sep 17 00:00:00 2001
+From: Ferrous Goose <ferrous@goose.invalid>
+Date: Sun, 25 Oct 2026 19:45:10 +1100
+Subject: [PATCH 6/8] Libraries a package ships: ./ dylibs spellings (Ferrous
+ Goose 0006)
+
+A dylibs spelling starting with ./ in a package's sidecar is a file from
+the package's own root, so a package can carry prebuilt libraries.
+---
+ docs/packages.md |  9 ++++++++-
+ src/ferrous.h    |  2 +-
+ src/packages.h   | 31 +++++++++++++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/docs/packages.md b/docs/packages.md
+index aef7fdde..2d9432a6 100644
+--- a/docs/packages.md
++++ b/docs/packages.md
+@@ -171,7 +171,14 @@ the platform suffixes, maps a name a block uses to the spelling to open
+ where the derived one is wrong, `dylibs_linux = ["SDL2=libSDL2-2.0.so.0"];`.
+ A package maps its own names as defaults; the program's sidecar maps a
+ name for any package it uses and wins, platform by platform, for the
+-names it mentions; a name no block declares is an error. A program
++names it mentions; a name no block declares is an error. A spelling
++starting with `./` in a package's sidecar is a file the package ships,
++from its own root, so a package can carry a prebuilt library for each
++platform: `dylibs_macos = ["mylib=./lib/macos/libmylib.dylib"];`. A
++`dylibs_<platform>_x86_64` or `dylibs_<platform>_arm64` list maps a name for
++one architecture of the platform, over the platform's list where the
++compiler runs on that architecture: `dylibs_linux_arm64 =
++["mylib=./lib/linux-arm64/libmylib.so"];`. A program
+ calling only such functions builds and links nothing, and runs under
+ `goose run` with no C toolchain installed. The rest of this section is
+ about C the package compiles itself.
+diff --git a/src/ferrous.h b/src/ferrous.h
+index 58d26d24..96ecb1ad 100644
+--- a/src/ferrous.h
++++ b/src/ferrous.h
+@@ -3,4 +3,4 @@
+ // lists so that cargo goose and goose_build know what the compiler can do.
+ #pragma once
+ 
+-#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate"
++#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate package-dylibs"
+diff --git a/src/packages.h b/src/packages.h
+index a5c49dcb..3880467e 100644
+--- a/src/packages.h
++++ b/src/packages.h
+@@ -137,6 +137,10 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+     for (auto key : lists)
+         for (auto suffix : { "", "_windows", "_linux", "_macos" }) known.push_back(cat(key, suffix));
+     if (isprogram) known.push_back("output");
++    // A spelling for one architecture of a platform (Ferrous Goose 0006),
++    // over the platform's own where the compiler runs on it.
++    for (auto os : { "_windows", "_linux", "_macos" })
++        for (auto arch : { "_x86_64", "_arm64" }) known.push_back(cat("dylibs", os, arch));
+     bf.CheckKeys(known);
+     #ifdef _WIN32
+         const char *platform = "_windows";
+@@ -176,6 +180,12 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+                 throw CompileError { cat(pkg.sidecar, ": ", key, " entry \"", e,
+                                          "\" is written name=spelling") };
+             auto name = e.substr(0, eq), spelling = e.substr(eq + 1);
++            // A package's `./` spelling is a file of its own, which it ships
++            // (prebuilt libraries per platform, Ferrous Goose 0006): the
++            // path from its root, made absolute where the program finds it.
++            // The program's own keeps meaning its resource directory.
++            if (!isprogram && spelling.rfind("./", 0) == 0)
++                spelling = ForwardSlashes(AbsolutePath(cat(pkg.root, spelling.substr(2))));
+             auto it = std::find_if(pkg.dylibs.begin(), pkg.dylibs.end(),
+                                    [&](auto &d) { return d.name == name; });
+             if (it == pkg.dylibs.end()) it = pkg.dylibs.insert(it, DylibSpelling { name });
+@@ -185,6 +195,27 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+             slot = spelling;
+         }
+     }
++    #if defined(__aarch64__) || defined(_M_ARM64)
++        const char *arch = "_arm64";
++    #else
++        const char *arch = "_x86_64";
++    #endif
++    for (auto os : { "_windows", "_linux", "_macos" }) {
++        auto key = cat("dylibs", os, arch);
++        for (auto &e : bf.Strings(key)) {
++            auto eq = e.find('=');
++            if (eq == string::npos || eq == 0 || eq + 1 == e.size())
++                throw CompileError { cat(pkg.sidecar, ": ", key, " entry \"", e,
++                                         "\" is written name=spelling") };
++            auto name = e.substr(0, eq), spelling = e.substr(eq + 1);
++            if (!isprogram && spelling.rfind("./", 0) == 0)
++                spelling = ForwardSlashes(AbsolutePath(cat(pkg.root, spelling.substr(2))));
++            auto it = std::find_if(pkg.dylibs.begin(), pkg.dylibs.end(),
++                                   [&](auto &d) { return d.name == name; });
++            if (it == pkg.dylibs.end()) it = pkg.dylibs.insert(it, DylibSpelling { name });
++            it->On(os) = spelling;
++        }
++    }
+     if (!pkg.csources.empty() && !pkg.cmake_target.empty())
+         throw CompileError { cat(pkg.sidecar, ": a package has either c_sources or a cmake_target") };
+     // A Rust crate (cargo.h): built now, so the module it writes is there
+-- 
+2.54.0
+

@@ -1,0 +1,18 @@
+[package]
+name = "goose-rs-image"
+description = "The image crate (PNG and JPEG) as a Goose package"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "goose_rs_image"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+goose.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[package.metadata.goose]
+namespace = "img"

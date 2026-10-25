@@ -1,0 +1,5 @@
+error: goose::export: the result borrows from several parameters ('a); Goose roots a result at one
+ --> tests/ui/borrow_from_two.rs:2:44
+  |
+2 | pub fn pick<'a>(a: &'a str, b: &'a str) -> &'a str {
+  |                                            ^^^^^^^

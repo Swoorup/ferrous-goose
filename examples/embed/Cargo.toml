@@ -1,0 +1,13 @@
+[package]
+name = "goose-embed-example"
+description = "A Rust program calling Goose code, built with cargo build alone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+goose.workspace = true
+
+[build-dependencies]
+goose-build.workspace = true

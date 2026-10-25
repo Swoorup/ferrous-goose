@@ -1,0 +1,14 @@
+word: no
+word: heap
+7 words
+spans 3 last at 5 len 3
+run of 1 x2
+run of 2 x1
+run of 3 x3
+countdown total 10
+next 2 1 true
+label 1
+label 2
+hit 0 at 0.0
+hit 2 at 1.0
+live 0

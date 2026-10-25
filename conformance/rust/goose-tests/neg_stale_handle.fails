@@ -1,0 +1,1 @@
+goose runtime error: stale cf::Stack handle (slot 0, generation 1)

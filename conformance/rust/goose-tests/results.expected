@@ -1,0 +1,12 @@
+div 7 true
+div by zero false
+parsed 1234 true
+bad int false: invalid digit found in string
+positive true
+not positive false: -5 is not positive
+hit 77 2.5 true
+name item-3 true
+no name false 0
+panic as failure: false: panic: negative input -3
+strict 99
+caught: cannot parse "nope": invalid digit found in string

@@ -1,0 +1,6 @@
+walk 34 true; live data kept: [7, 8, 9, 10]
+tally: false: export fn tally uses a var global, so it cannot be called back during a call into C
+missing: false: the program has no export fn missing
+wrong: false: export fn wrong is (f64->f64), not (i64->i64)
+nudged 1.5 2.5
+count untouched: 0

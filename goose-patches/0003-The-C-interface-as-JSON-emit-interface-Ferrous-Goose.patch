@@ -1,0 +1,346 @@
+From c70a2f91c82afd87a95616248855705f6e4eee06 Mon Sep 17 00:00:00 2001
+From: Ferrous Goose <ferrous@goose.invalid>
+Date: Sun, 25 Oct 2026 19:34:23 +1100
+Subject: [PATCH 3/8] The C interface as JSON: --emit-interface (Ferrous Goose
+ 0003)
+
+Each export's parameters and results, and the layout of every struct and
+enum they reach, as the backend lays them out; goose check
+--emit-interface json writes only that.
+---
+ docs/goose_spec.md |   9 ++
+ src/ferrous.h      |   2 +-
+ src/interface.h    | 222 +++++++++++++++++++++++++++++++++++++++++++++
+ src/main.cpp       |  22 ++++-
+ 4 files changed, 252 insertions(+), 3 deletions(-)
+ create mode 100644 src/interface.h
+
+diff --git a/docs/goose_spec.md b/docs/goose_spec.md
+index b114899a..b0ff6c2c 100644
+--- a/docs/goose_spec.md
++++ b/docs/goose_spec.md
+@@ -3029,6 +3029,15 @@ thread. `--header` requires generated C output and at least one export, and
+ writes declarations and the required packed C type definitions for the
+ exported API.
+ 
++`--emit-interface out.json` (or `json` for stdout; with `goose check`, it
++writes nothing else) describes the program's C interface for a binding
++generator in another language: each export's name, symbol, documentation,
++parameters and results, each with its Goose type as text and structurally
++(`prim`, `struct`, `enum`, `array`, `slice`, `ref`, `builder`), and every
++struct and enum the exports reach, with each field's offset and size and
++each pad as the C backend lays them out (C.2), and the source files the
++program was compiled from.
++
+ An exported C symbol is emitted as written, as an `extern` one is, and must be a
+ C identifier that is not a C keyword and that the program does not otherwise
+ reserve (`main`, `goose_init`, or a name beginning with `gs_`).
+diff --git a/src/ferrous.h b/src/ferrous.h
+index 8ed6a6ff..df70dd75 100644
+--- a/src/ferrous.h
++++ b/src/ferrous.h
+@@ -3,4 +3,4 @@
+ // lists so that cargo goose and goose_build know what the compiler can do.
+ #pragma once
+ 
+-#define FERROUS_FEATURES "typed-builders export-results"
++#define FERROUS_FEATURES "typed-builders export-results emit-interface"
+diff --git a/src/interface.h b/src/interface.h
+new file mode 100644
+index 00000000..6c36303f
+--- /dev/null
++++ b/src/interface.h
+@@ -0,0 +1,222 @@
++// Goose compiler — the program's C interface as JSON (`--emit-interface`):
++// its export fns with their parameters and results, and the layout of
++// every struct and enum they reach, as the C backend lays them out (C.2).
++// What a binding generator in another language (Ferrous Goose's
++// goose_build, for Rust) builds its side from, and what it checks a
++// binding it wrote against. Written by the backend, which owns the layouts;
++// `goose check --emit-interface` runs it for that and writes nothing else.
++#pragma once
++
++namespace goose {
++
++struct InterfaceWriter {
++    CodeGen &cg;
++    Ast &ast;
++    string out;
++    vector<StructInst *> structs;
++    vector<EnumInst *> enums;
++    set<const void *> seen;
++
++    void Type(TypeExpr *t) {
++        switch (t->kind) {
++            case TY_INT:
++                Append(out, "{\"prim\":\"", IntStorageName(t->intstorage), "\"}");
++                return;
++            case TY_FLT:
++                Append(out, "{\"prim\":\"", t->fltstorage == FS_F32 ? "f32" : "f64", "\"}");
++                return;
++            case TY_BOOL:
++                out += "{\"prim\":\"bool\"}";
++                return;
++            case TY_STRUCT: {
++                auto si = cg.SI(t);
++                if (seen.insert(si).second) structs.push_back(si);
++                out += "{\"struct\":";
++                JsonQuote(out, si->st->qname);
++                out += "}";
++                return;
++            }
++            case TY_ENUM: {
++                auto ei = cg.EIOf(t);
++                if (seen.insert(ei).second) enums.push_back(ei);
++                out += "{\"enum\":";
++                JsonQuote(out, ei->en->qname);
++                out += "}";
++                return;
++            }
++            case TY_ARRAY:
++                if (t->arr->akind == A_FIXED) {
++                    out += "{\"array\":{\"elem\":";
++                    Type(t->arr->sub);
++                    Append(out, ",\"len\":", cg.ArrSize(t->arr), "}}");
++                    return;
++                }
++                break;
++            case TY_SLICE:
++                out += "{\"slice\":{\"elem\":";
++                Type(t->sub);
++                Append(out, ",\"const\":", t->cq ? "true" : "false", "}}");
++                return;
++            case TY_REF:
++                if (t->ref->sub->kind == TY_ARRAY && t->ref->sub->arr->akind == A_GROW) {
++                    out += "{\"builder\":{\"elem\":";
++                    Type(t->ref->sub->arr->sub);
++                    out += "}}";
++                    return;
++                }
++                out += "{\"ref\":{\"to\":";
++                Type(t->ref->sub);
++                Append(out, ",\"const\":", t->cq ? "true" : "false", "}}");
++                return;
++            default:
++                break;
++        }
++        string s;
++        t->Dump(s);
++        out += "{\"other\":";
++        JsonQuote(out, s);
++        out += "}";
++    }
++
++    void Text(TypeExpr *t) {
++        string s;
++        t->Dump(s);
++        JsonQuote(out, s);
++    }
++
++    void Fields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
++                const CodeGen::Layout &lo) {
++        out += "[";
++        auto first = true;
++        for (size_t i = 0; i < fields.size(); i++) {
++            auto &f = fields[i];
++            if (!first) out += ",";
++            first = false;
++            auto off = i < lo.offs.size() ? lo.offs[i] : 0;
++            if (f.ispad || !ftypes[i]) {
++                auto next = i + 1 < lo.offs.size() ? lo.offs[i + 1] : lo.size;
++                Append(out, "{\"pad\":", next - off, ",\"offset\":", off, "}");
++                continue;
++            }
++            out += "{\"name\":";
++            JsonQuote(out, f.name);
++            out += ",\"type\":";
++            Type(ftypes[i]);
++            out += ",\"text\":";
++            Text(ftypes[i]);
++            Append(out, ",\"offset\":", off, ",\"size\":", cg.FixedSize(ftypes[i]), "}");
++        }
++        out += "]";
++    }
++
++    string Write(const string &runtime, const string &features) {
++        out = "{\"format\":1,\"goose_runtime\":";
++        JsonQuote(out, runtime);
++        out += ",\"ferrous\":";
++        JsonQuote(out, features);
++        out += ",\"sources\":[";
++        for (size_t i = 0; i < ast.sources.size(); i++) {
++            if (i) out += ",";
++            JsonQuote(out, ast.sources[i].first);
++        }
++        out += "],\"exports\":[";
++        auto first = true;
++        for (auto sf : ast.functions) {
++            if (!sf->isexport || sf->specs.size() != 1) continue;
++            auto sp = sf->specs[0];
++            if (!first) out += ",";
++            first = false;
++            out += "{\"name\":";
++            JsonQuote(out, sf->name);
++            out += ",\"qname\":";
++            JsonQuote(out, sf->qname);
++            out += ",\"symbol\":";
++            JsonQuote(out, sf->cname);
++            out += ",\"doc\":";
++            JsonQuote(out, sf->doc);
++            out += ",\"params\":[";
++            for (size_t i = 0; i < sp->argtypes.size(); i++) {
++                if (i) out += ",";
++                out += "{\"name\":";
++                JsonQuote(out, i < sf->params.size() ? sf->params[i].name : string_view("arg"));
++                out += ",\"type\":";
++                Type(sp->argtypes[i]);
++                out += ",\"text\":";
++                Text(sp->argtypes[i]);
++                out += "}";
++            }
++            out += "],\"results\":[";
++            for (size_t i = 0; i < sp->rets.size(); i++) {
++                if (i) out += ",";
++                out += "{\"type\":";
++                Type(sp->rets[i]);
++                out += ",\"text\":";
++                Text(sp->rets[i]);
++                out += "}";
++            }
++            out += "]}";
++        }
++        // The types the exports reach, and the ones those reach.
++        string types = "],\"structs\":[";
++        string enumtext = "],\"enums\":[";
++        for (size_t k = 0, e = 0; k < structs.size() || e < enums.size();) {
++            if (k < structs.size()) {
++                auto si = structs[k++];
++                auto save = std::move(out);
++                out.clear();
++                auto &lo = cg.StructLayout(si);
++                out += "{\"name\":";
++                JsonQuote(out, si->st->name);
++                out += ",\"qname\":";
++                JsonQuote(out, si->st->qname);
++                out += ",\"doc\":";
++                JsonQuote(out, si->st->doc);
++                Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"fields\":");
++                Fields(si->st->fields, si->ftypes, lo);
++                out += "}";
++                if (types.back() != '[') types += ",";
++                types += out;
++                out = std::move(save);
++                continue;
++            }
++            auto ei = enums[e++];
++            auto save = std::move(out);
++            out.clear();
++            int64_t maxp = 0;
++            for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
++                maxp = std::max(maxp, cg.VariantLayout(ei, (int)vi).size);
++            out += "{\"name\":";
++            JsonQuote(out, ei->en->name);
++            out += ",\"qname\":";
++            JsonQuote(out, ei->en->qname);
++            out += ",\"doc\":";
++            JsonQuote(out, ei->en->doc);
++            Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
++                   ",\"variants\":[");
++            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
++                if (vi) out += ",";
++                auto &v = ei->en->variants[vi];
++                out += "{\"name\":";
++                JsonQuote(out, v.name);
++                Append(out, ",\"tag\":", vi, ",\"fields\":");
++                Fields(v.fields, ei->vftypes[vi], cg.VariantLayout(ei, (int)vi));
++                out += "}";
++            }
++            out += "]}";
++            if (enumtext.back() != '[') enumtext += ",";
++            enumtext += out;
++            out = std::move(save);
++        }
++        out += types;
++        out += enumtext;
++        out += "]}\n";
++        return out;
++    }
++};
++
++inline string InterfaceJson(CodeGen &cg, Ast &ast, const string &runtime, const string &features) {
++    InterfaceWriter w { cg, ast, {}, {}, {}, {} };
++    return w.Write(runtime, features);
++}
++
++}  // namespace goose
+diff --git a/src/main.cpp b/src/main.cpp
+index 8d5ae6d1..42c24482 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -45,6 +45,7 @@
+ #include "progress.h"
+ #include "buildfile.h"
+ #include "json.h"
++#include "interface.h"
+ #include "toolchain.h"
+ #include "builtin.h"
+ #include "build.h"
+@@ -855,6 +856,9 @@ Options:
+   --standalone          Write C that holds the whole runtime and builds alone.
+   --header out.h        Also write a header for a C host, which supplies main
+                         and starts the program through goose_init.
++  --emit-interface F    Also write the exports and the layouts of the types
++                        they reach as JSON, to F (json or - for stdout);
++                        goose check --emit-interface json writes only that.
+   --include header.h    Have the C include this header (may be repeated).
+   --jit                 Also run the program in this process.
+   --emit-runtime out.c  Write the runtime's C.
+@@ -1054,7 +1058,7 @@ int Main(int argc, char **argv) {
+         return 0;
+     }
+     if (verb == "lsp") return RunLsp(exe, vector<string>(argv + firstarg, argv + argc));
+-    string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile;
++    string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile, interfacename;
+     auto dump = false, dumpdocs = false, tokens = false, parseonly = false, specs = false;
+     auto nocgen = false;
+     auto roundtrip = false, multitest = false;
+@@ -1155,6 +1159,7 @@ int Main(int argc, char **argv) {
+         else if (arg == "-O2") optlevel = 2;
+         else if (arg == "-o" && i + 1 < argc) outname = argv[++i];
+         else if (arg == "--header" && i + 1 < argc) headername = argv[++i];
++        else if (arg == "--emit-interface" && i + 1 < argc) interfacename = argv[++i];
+         else if (arg == "--include" && i + 1 < argc) includenames.push_back(argv[++i]);
+         else if (arg == "--stdlib" && i + 1 < argc) stdlibdir = argv[++i];
+         else if (arg == "--cc" && i + 1 < argc) ccrequest = argv[++i];
+@@ -1372,7 +1377,7 @@ int Main(int argc, char **argv) {
+         }
+         // --stacks needs the generated program's bounds, so --check runs
+         // the backend for them and writes nothing.
+-        if (nocgen && !stacks) return 0;
++        if (nocgen && !stacks && interfacename.empty()) return 0;
+         // A quoted include resolves against the including file's own directory
+         // first, so the --include headers are written relative to where the .c
+         // goes: the generated file then compiles wherever the tree sits,
+@@ -1391,6 +1396,19 @@ int Main(int argc, char **argv) {
+         auto stackcfg = StackConfigOf(cdefines);
+         CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+         if (stacks) cg.StackReport(msgs, stackcfg);
++        // The C interface as JSON: to stdout for `json` or `-`, else the
++        // file named (interface.h).
++        if (!interfacename.empty()) {
++            auto text = InterfaceJson(cg, ast, RuntimeVersion(), FERROUS_FEATURES);
++            if (interfacename == "json" || interfacename == "-") {
++                fwrite(text.data(), 1, text.size(), stdout);
++            } else {
++                if (!WriteFileMakingDirs(interfacename, text))
++                    throw CompileError { cat("cannot write the interface: ", interfacename) };
++                fprintf(msgs, "wrote %s (%d bytes)\n", interfacename.c_str(), (int)text.size());
++            }
++            if (nocgen) return 0;
++        }
+         // The packages whose native parts the program needs, which a JIT
+         // run takes functions from and a build links: its own, when it has
+         // one, and every package an extern fn it calls was declared in,
+-- 
+2.54.0
+

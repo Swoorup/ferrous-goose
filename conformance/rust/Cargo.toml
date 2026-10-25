@@ -1,0 +1,20 @@
+[package]
+name = "goose-conformance"
+description = "Every row of the Ferrous Goose type map, exported for the Goose test programs in goose-tests/"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+goose.workspace = true
+
+[dev-dependencies]
+cargo-goose = { path = "../../crates/cargo-goose" }
+libloading = "0.8"
+
+[package.metadata.goose]
+namespace = "cf"

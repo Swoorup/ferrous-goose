@@ -1,0 +1,13 @@
+[package]
+name = "goose-embed-conformance"
+description = "Rust calling Goose: every export shape, checked from Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+goose.workspace = true
+
+[build-dependencies]
+goose-build.workspace = true

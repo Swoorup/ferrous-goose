@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/goose",
+    "crates/goose-macros",
+    "crates/cargo-goose",
+    "examples/regex/rust",
+    "examples/shapes/rust",
+    "conformance/rust",
+    "crates/goose-build",
+    "examples/embed",
+    "conformance/embed",
+    "packages/regex/rust",
+    "packages/json/rust",
+    "packages/image/rust",
+    "packages/sqlite/rust",
+    "bench/rust",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/goose-rs/ferrous-goose"
+rust-version = "1.80"
+
+[workspace.dependencies]
+goose = { package = "ferrous-goose", path = "crates/goose", version = "0.1.0" }
+goose-build = { package = "ferrous-goose-build", path = "crates/goose-build", version = "0.1.0" }
+
+[profile.release]
+debug = 1

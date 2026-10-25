@@ -1,0 +1,16 @@
+[package]
+name = "goose-shapes"
+description = "Phase 3 shapes from Goose: enums with data, generics, iterators, optional parameters, callbacks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+goose.workspace = true
+
+[package.metadata.goose]
+namespace = "geo"

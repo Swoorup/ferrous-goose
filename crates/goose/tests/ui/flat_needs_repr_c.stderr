@@ -1,0 +1,5 @@
+error: goose::Flat: a struct needs #[repr(C)], so its fields stay in declaration order where Goose declares them
+ --> tests/ui/flat_needs_repr_c.rs:2:12
+  |
+2 | pub struct Point {
+  |            ^^^^^

@@ -1,0 +1,134 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  GOOSE_PROGRESS: plain
+
+jobs:
+  # The bridge on each platform: the Goose compiler stock and patched, the
+  # Rust tests, the conformance suite in both directions, the examples.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang
+      - name: Build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja || true
+      - name: Visual Studio environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Goose, stock and patched
+        run: |
+          scripts/toolchain.sh --stock
+          scripts/toolchain.sh
+          .toolchain/goose/build/goose version
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Conformance, Goose using Rust (stock)
+        run: cargo run -q -p cargo-goose -- test --manifest-path conformance/rust/Cargo.toml --goose .toolchain/goose-stock/build/goose conformance/rust/goose-tests
+      - name: Conformance, Goose using Rust (patched)
+        run: cargo run -q -p cargo-goose -- test --manifest-path conformance/rust/Cargo.toml --goose .toolchain/goose/build/goose conformance/rust/goose-tests
+      - name: Conformance, Rust using Goose (stock)
+        run: GOOSE=$PWD/.toolchain/goose-stock/build/goose cargo run -q -p goose-embed-conformance
+      - name: Conformance, Rust using Goose (patched)
+        run: GOOSE=$PWD/.toolchain/goose/build/goose cargo run -q -p goose-embed-conformance
+      - name: Examples
+        run: |
+          cargo run -q -p cargo-goose -- run examples/regex/goose/find_emails.goose --manifest-path examples/regex/rust/Cargo.toml
+          cargo run -q -p goose-embed-example
+          cargo build -q --release -p cargo-goose
+          GOOSE_CARGO_GOOSE=$PWD/target/release/cargo-goose .toolchain/goose/build/goose run examples/regex/linked/find_emails.goose
+          GOOSE_CARGO_GOOSE=$PWD/target/release/cargo-goose .toolchain/goose/build/goose build examples/regex/linked/find_emails.goose
+          cd examples/multi
+          GOOSE_CARGO_GOOSE=$PWD/../../target/release/cargo-goose ../../.toolchain/goose/build/goose run multi.goose
+          GOOSE_CARGO_GOOSE=$PWD/../../target/release/cargo-goose ../../.toolchain/goose/build/goose build multi.goose
+          ./multi
+      - name: The overhead budget
+        if: runner.os != 'Windows'
+        run: bench/run.sh && cat bench/RESULTS.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the compiler for the package checks
+        run: |
+          mkdir -p goose-dist/build
+          cp -r .toolchain/goose/stdlib goose-dist/stdlib
+          cp .toolchain/goose/build/goose* goose-dist/build/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goose-${{ runner.os }}
+          path: goose-dist
+
+  # The packages over regex, serde_json, image and rusqlite, built for every
+  # platform from one machine (macOS: a universal library; Linux and Windows
+  # through cargo zigbuild).
+  packages:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu
+      - name: Cross tools
+        run: |
+          brew install zig ninja
+          cargo install cargo-zigbuild --locked
+      - name: Goose
+        run: scripts/toolchain.sh
+      - name: Package
+        run: |
+          cargo build -q --release -p cargo-goose
+          for p in regex json image sqlite; do
+            target/release/cargo-goose package packages/$p/dist --manifest-path packages/$p/rust/Cargo.toml \
+              --targets aarch64-apple-darwin,x86_64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu --zig
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: packages/*/dist
+
+  # Someone with no Rust: the packages and a Goose compiler, on a machine
+  # whose PATH has no cargo or rustc, running each package's examples.
+  no-rust:
+    needs: [test, packages]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: goose-${{ runner.os }}
+          path: goose
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - name: Run every package's examples without Rust
+        run: |
+          chmod +x goose/build/goose* || true
+          G=$PWD/goose/build/goose
+          rm -rf ~/.cargo/bin ~/.rustup || true
+          if command -v cargo || command -v rustc; then echo "Rust is still on PATH"; exit 1; fi
+          fail=0
+          for ex in packages/*/dist/examples/*.goose; do
+            (cd "$(dirname "$ex")" && "$G" run "$(basename "$ex")" > out.txt) || { echo "FAIL $ex"; fail=1; continue; }
+            if diff -u --strip-trailing-cr "${ex%.goose}.expected" "$(dirname "$ex")/out.txt"; then echo "ok   $ex"; else echo "FAIL $ex"; fail=1; fi
+          done
+          exit $fail

@@ -1,0 +1,11 @@
+depth 3
+popped 3 true, depth 2
+after move_all 3 and 1
+live 2 stacks 2
+sum taken 13
+live after take 1
+live after release 0
+in scope depth 1
+after scope 0
+local 2
+leaks: [] live 0

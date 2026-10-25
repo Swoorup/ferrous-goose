@@ -1,0 +1,10 @@
+name: goose
+legs: 2
+second tag: loud
+key: name
+key: legs
+key: tags
+key: safe
+{"name":"goose","legs":2,"tags":["fast","loud"],"safe":true,"eggs":3}
+bad json: false, an error: true
+live: 0

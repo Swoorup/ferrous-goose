@@ -1,0 +1,16 @@
+[package]
+name = "ferrous-goose-macros"
+description = "The attributes of Ferrous Goose: #[goose::export], #[goose::handle], #[derive(goose::Flat)]"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "visit-mut"] }
+quote = "1"
+proc-macro2 = "1"

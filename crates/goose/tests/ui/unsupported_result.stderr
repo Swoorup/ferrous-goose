@@ -1,0 +1,5 @@
+error: goose::export: tuples cannot cross yet; return a goose::Flat struct
+ --> tests/ui/unsupported_result.rs:2:18
+  |
+2 | pub fn pair() -> (i64, i64) {
+  |                  ^^^^^^^^^^

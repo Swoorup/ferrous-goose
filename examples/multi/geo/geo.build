@@ -1,0 +1,2 @@
+// The shapes crate as a package of this program, built and linked with it.
+cargo_crate = "../../shapes/rust";

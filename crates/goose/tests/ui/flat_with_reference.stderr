@@ -1,0 +1,16 @@
+error[E0277]: the trait bound `&'static str: goose::Value` is not satisfied
+ --> tests/ui/flat_with_reference.rs:4:11
+  |
+4 |     name: &'static str,
+  |           ^^^^^^^^^^^^ the trait `goose::Value` is not implemented for `&'static str`
+  |
+  = help: the following other types implement trait `goose::Value`:
+            GooseSpan
+            Named
+            [T; N]
+            bool
+            char
+            f32
+            f64
+            i16
+          and $N others

@@ -1,0 +1,19 @@
+[package]
+name = "goose-regex"
+description = "The regex crate for Goose programs, through Ferrous Goose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# cdylib for goose run (an extern block opens it), staticlib for a
+# cargo_crate build that links it, rlib for Rust tests.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+goose.workspace = true
+regex = "1"
+
+[package.metadata.goose]
+namespace = "rx"

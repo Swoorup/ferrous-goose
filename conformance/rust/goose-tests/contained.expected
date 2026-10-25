@@ -1,0 +1,3 @@
+worker returned: false
+its message: stale cf::Stack handle (slot 0, generation 1) (rust cf::push)
+the program runs on; live 0

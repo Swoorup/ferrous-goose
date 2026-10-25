@@ -1,0 +1,407 @@
+From 9c10a6d40f6f250a802f630215b6dc81d2b824e6 Mon Sep 17 00:00:00 2001
+From: Ferrous Goose <ferrous@goose.invalid>
+Date: Sun, 25 Oct 2026 19:44:11 +1100
+Subject: [PATCH 5/8] A Rust crate as a native part: cargo_crate (Ferrous Goose
+ 0005)
+
+A sidecar's cargo_crate names a crate using Ferrous Goose's
+#[goose::export]; cargo goose native builds it and writes its module as
+the sidecar loads, a build links its static library and a run builds the
+JIT library from it. The program hands the crate the runtime's hooks.
+---
+ docs/packages.md   |  21 +++++++
+ src/ast.h          |  15 ++++-
+ src/cargo.h        | 141 +++++++++++++++++++++++++++++++++++++++++++++
+ src/codegen_emit.h |  13 +++++
+ src/ferrous.h      |   2 +-
+ src/main.cpp       |   5 ++
+ src/native.h       |  42 ++++++++++++++
+ src/packages.h     |  18 +++++-
+ 8 files changed, 252 insertions(+), 5 deletions(-)
+ create mode 100644 src/cargo.h
+
+diff --git a/docs/packages.md b/docs/packages.md
+index ffe04508..aef7fdde 100644
+--- a/docs/packages.md
++++ b/docs/packages.md
+@@ -228,6 +228,27 @@ void mylib_name(gs_rref out, int64_t id) {   /* extern fn mylib_name(out: u8[>..
+ }
+ ```
+ 
++Or a Rust crate using Ferrous Goose's `#[goose::export]`, by its directory:
++
++```goose
++// mylib.build
++cargo_crate = "rust";              // goose build links its staticlib, goose run its JIT library
++cargo_features = ["unicode"];
++```
++
++The compiler runs `cargo goose native` on the crate as the sidecar loads,
++which builds it and writes the Goose module for its exports into the
++package's root (named for the crate's namespace, `[package.metadata.goose]
++namespace`), where the program's imports find it; a build links the
++crate's static library with the system libraries rustc names, and a run
++builds the JIT library from it. Cargo, and `cargo-goose` on PATH (or
++`GOOSE_CARGO_GOOSE` naming it), are needed then, and a crate's
++`crate-type` lists `staticlib`. Where the program and its packages name
++several crates, `cargo goose combine` builds one static library holding
++them all (each crate needs `rlib` among its crate types, to be a dependency
++of that library), since two Rust static libraries would each define Rust's
++own symbols.
++
+ A package's C is self-contained: two packages that must share C share a
+ repository, as `gfx`, `audio` and `ui` do. A package whose functions keep
+ one state for the process, or that may only be called from the main thread,
+diff --git a/src/ast.h b/src/ast.h
+index 403b0eaa..61578de8 100644
+--- a/src/ast.h
++++ b/src/ast.h
+@@ -2369,8 +2369,19 @@ struct Package {
+     vector<DylibSpelling> dylibs;           // The sidecar's, by name, each once.
+     string output;                          // A program's executable, relative to its root.
+     vector<int> required;                   // The packages its files require (§4.3), by index.
+-
+-    bool HasNative() const { return !csources.empty() || !cmake_target.empty(); }
++    // A Rust crate built with cargo goose (Ferrous Goose 0005, cargo.h): its
++    // directory, absolute; its features; and what the build made.
++    string cargo_crate;
++    vector<string> cargo_features;
++    string cargo_staticlib, cargo_module;
++    vector<string> cargo_native_libs;
++    // Where several packages have crates, one static library holds them all
++    // (CombineCargoCrates): the package whose part it is, for the others.
++    int cargo_owner = -1;
++
++    bool HasNative() const {
++        return !csources.empty() || !cmake_target.empty() || !cargo_staticlib.empty();
++    }
+ };
+ 
+ struct Ast {
+diff --git a/src/cargo.h b/src/cargo.h
+new file mode 100644
+index 00000000..efbafdc2
+--- /dev/null
++++ b/src/cargo.h
+@@ -0,0 +1,141 @@
++// Goose compiler — a Rust crate as a package's native part (Ferrous Goose
++// 0005): the sidecar's `cargo_crate = "dir";` names a crate using Ferrous
++// Goose's #[goose::export], and `cargo goose native` builds it, writes the
++// Goose module for its exports beside the sidecar and says where its static
++// library is. A build links that library as it links a package's C, a run
++// builds the JIT library from it, and both run the crate's build again
++// whenever the program is compiled, which Cargo makes cheap when nothing
++// changed.
++#pragma once
++
++namespace goose {
++
++// Whether loading a sidecar may run Cargo: the compiling verbs say so, the
++// language server does not (it reads the module the last build wrote).
++inline bool &CargoBuildsAllowed() {
++    static bool allowed = false;
++    return allowed;
++}
++
++// The compiler's own path, which cargo goose asks what it can do.
++inline string &GooseExePath() {
++    static string exe;
++    return exe;
++}
++
++// How cargo goose is run: $GOOSE_CARGO_GOOSE, a cargo-goose binary, or
++// `cargo goose` with the subcommand on PATH.
++inline vector<string> CargoGooseCommand() {
++    if (auto e = getenv("GOOSE_CARGO_GOOSE"); e && *e) return { e };
++    auto direct = FindOnPath("cargo-goose");
++    if (!direct.empty()) return { direct };
++    auto cargo = FindOnPath("cargo");
++    if (cargo.empty()) return {};
++    return { cargo, "goose" };
++}
++
++// Builds the package's crate, when its sidecar names one, and records what
++// the build made. The module lands in the package's root; a package fetched
++// from git builds under GOOSE_HOME rather than in its checkout's target/.
++inline void BuildCargoCrate(Package &pkg) {
++    if (pkg.cargo_crate.empty() || !CargoBuildsAllowed()) return;
++    auto cmd = CargoGooseCommand();
++    if (cmd.empty())
++        throw CompileError { cat(pkg.sidecar, ": cargo_crate needs Cargo and cargo-goose (cargo install "
++                                 "cargo-goose), and neither cargo-goose nor cargo is on PATH") };
++    auto manifest = cat(pkg.cargo_crate, "/Cargo.toml");
++    if (!PathExists(manifest))
++        throw CompileError { cat(pkg.sidecar, ": cargo_crate names ", pkg.cargo_crate,
++                                 ", which has no Cargo.toml") };
++    auto outdir = pkg.root.empty() ? string(".") : pkg.root;
++    vector<string> argv = cmd;
++    for (auto &a : vector<string> { "native", "--manifest-path", manifest, "--out-dir", outdir })
++        argv.push_back(a);
++    if (!pkg.cargo_features.empty()) {
++        string f;
++        for (auto &x : pkg.cargo_features) Append(f, f.empty() ? "" : ",", x);
++        argv.push_back("--features");
++        argv.push_back(f);
++    }
++    if (!pkg.cachekey.empty()) {
++        argv.push_back("--target-dir");
++        argv.push_back(cat(GooseHome(), "/build/cargo/", pkg.cachekey));
++    }
++    if (!GooseExePath().empty()) {
++        argv.push_back("--goose");
++        argv.push_back(GooseExePath());
++    }
++    ProgressStep step(cat("building the package ", pkg.name, "'s crate with Cargo"), true);
++    auto r = RunProcess(argv);
++    if (!r.started || r.code != 0)
++        throw CompileError { cat(pkg.sidecar, ": building the crate ", pkg.cargo_crate,
++                                 " failed:\n", r.output) };
++    // The last line holding the report is what cargo goose printed.
++    auto at = r.output.rfind("goose-native: ");
++    if (at == string::npos)
++        throw CompileError { cat(pkg.sidecar, ": cargo goose native printed no report:\n", r.output) };
++    auto line = r.output.substr(at + 14);
++    line = line.substr(0, line.find('\n'));
++    auto j = ParseJson(line);
++    pkg.cargo_staticlib = j.Str("staticlib");
++    pkg.cargo_module = j.Str("module");
++    pkg.cargo_native_libs.clear();
++    if (auto libs = j.Get("native_libs"))
++        for (auto &l : libs->arr) pkg.cargo_native_libs.push_back(l.str);
++}
++
++// Several crates in one program link as one static library: two would each
++// carry Rust's standard library and define its symbols twice. cargo goose
++// combine builds an umbrella crate depending on every one; the first
++// package's native part becomes that library, and the others' functions
++// are found in it (cargo_owner).
++inline void CombineCargoCrates(Ast &ast) {
++    vector<int> pkgs;
++    for (size_t i = 0; i < ast.packages.size(); i++)
++        if (!ast.packages[i].cargo_staticlib.empty()) pkgs.push_back((int)i);
++    if (pkgs.size() < 2 || !CargoBuildsAllowed()) return;
++    auto cmd = CargoGooseCommand();
++    string key;
++    vector<string> crates;
++    for (auto i : pkgs) {
++        auto &p = ast.packages[i];
++        string c = p.cargo_crate;
++        if (!p.cargo_features.empty()) {
++            c += ":";
++            for (size_t f = 0; f < p.cargo_features.size(); f++)
++                Append(c, f ? "," : "", p.cargo_features[f]);
++        }
++        crates.push_back(c);
++        Append(key, c, "\n");
++    }
++    auto outdir = cat(GooseHome(), "/build/cargo/combined-", Hex8(key));
++    vector<string> argv = cmd;
++    argv.push_back("combine");
++    argv.push_back("--out-dir");
++    argv.push_back(outdir);
++    for (auto &c : crates) {
++        argv.push_back("--crate");
++        argv.push_back(c);
++    }
++    ProgressStep step(cat("linking ", pkgs.size(), " crates as one library with Cargo"), true);
++    auto r = RunProcess(argv);
++    if (!r.started || r.code != 0)
++        throw CompileError { cat("combining the program's crates failed:\n", r.output) };
++    auto at = r.output.rfind("goose-native: ");
++    if (at == string::npos)
++        throw CompileError { cat("cargo goose combine printed no report:\n", r.output) };
++    auto line = r.output.substr(at + 14);
++    line = line.substr(0, line.find('\n'));
++    auto j = ParseJson(line);
++    auto &owner = ast.packages[pkgs[0]];
++    owner.cargo_staticlib = j.Str("staticlib");
++    owner.cargo_native_libs.clear();
++    if (auto libs = j.Get("native_libs"))
++        for (auto &l : libs->arr) owner.cargo_native_libs.push_back(l.str);
++    for (size_t k = 1; k < pkgs.size(); k++) {
++        ast.packages[pkgs[k]].cargo_owner = pkgs[0];
++        ast.packages[pkgs[k]].cargo_staticlib.clear();
++    }
++}
++
++}  // namespace goose
+diff --git a/src/codegen_emit.h b/src/codegen_emit.h
+index 021025c7..525ff134 100644
+--- a/src/codegen_emit.h
++++ b/src/codegen_emit.h
+@@ -895,6 +895,19 @@ inline void CodeGen::EmitProgramInit() {
+     if (!dllibs.empty())
+         Append(code, "    gs_dl_bind(gs_dllibs, ", dllibs.size(), ", gs_dlbinds, ", dlbinds,
+                ");\n");
++    // A Rust crate linked into the program (Ferrous Goose 0005) gets the
++    // runtime's hooks as a library an extern block opens does: the
++    // program's own, or a package's whose functions it calls.
++    auto cargo = !ast.packages.empty() && !ast.packages[0].cargo_staticlib.empty();
++    for (auto sp : usedexterns) {
++        if (!sp->sf->dylib.empty()) continue;
++        auto pkg = ast.filepkg[sp->sf->line.fileidx];
++        cargo = cargo || !ast.packages[pkg].cargo_staticlib.empty() || ast.packages[pkg].cargo_owner >= 0;
++    }
++    if (cargo) {
++        Append(data, "void goose_runtime_hooks(const gs_rt_hooks *);\n");
++        Append(code, "    gs_rt_give_hooks(goose_runtime_hooks);\n");
++    }
+     // The queues, before anything that could use one runs.
+     vector<string> qnames;
+     for (auto &[m, q] : queues) qnames.push_back(q);
+diff --git a/src/ferrous.h b/src/ferrous.h
+index abced685..58d26d24 100644
+--- a/src/ferrous.h
++++ b/src/ferrous.h
+@@ -3,4 +3,4 @@
+ // lists so that cargo goose and goose_build know what the compiler can do.
+ #pragma once
+ 
+-#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks"
++#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks cargo-crate"
+diff --git a/src/main.cpp b/src/main.cpp
+index 42c24482..871fa82a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -48,6 +48,7 @@
+ #include "interface.h"
+ #include "toolchain.h"
+ #include "builtin.h"
++#include "cargo.h"
+ #include "build.h"
+ #include "packages.h"
+ #include "native.h"
+@@ -1290,10 +1291,14 @@ int Main(int argc, char **argv) {
+         auto &ast = *astp;
+         if (jsondiag) ast.sink = [&](const Diagnostic &d) { found.push_back(d); };
+         auto stdlibdirs = StdlibDirs(stdlibdir, exe);
++        // A sidecar's cargo_crate is built as it loads (cargo.h).
++        CargoBuildsAllowed() = !parseonly;
++        GooseExePath() = exe;
+         ParseProgram(ast, filename, stdlibdirs, DirOf(exe));
+         // The parser reported what it recovered from as it went; nothing
+         // further is asked of a program with a syntax error.
+         if (!ast.errors.empty()) return 1;
++        CombineCargoCrates(ast);
+         if (dumpdocs) {
+             string s;
+             DumpDocs(ast, s);
+diff --git a/src/native.h b/src/native.h
+index 00cdeccf..b3fec023 100644
+--- a/src/native.h
++++ b/src/native.h
+@@ -18,6 +18,8 @@ inline vector<int> NativePackagesUsed(const Ast &ast, const vector<FnSpec *> &us
+         // One bound from a shared library at run time comes from no package's C.
+         if (!sp->sf->dylib.empty()) continue;
+         auto pkg = ast.filepkg[sp->sf->line.fileidx];
++        // A crate linked in another package's library (CombineCargoCrates).
++        if (ast.packages[pkg].cargo_owner >= 0) pkg = ast.packages[pkg].cargo_owner;
+         if (ast.packages[pkg].HasNative()) needed.insert(pkg);
+     }
+     // A package's depth is one more than the deepest it requires; deeper
+@@ -471,12 +473,23 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+     // is as the command line named the program, and a build that named it
+     // another way is the same build.
+     auto inputs = p.csources;
++    if (!p.cargo_staticlib.empty()) inputs.push_back(p.cargo_staticlib);
+     inputs.push_back(ForwardSlashes(AbsolutePath(p.sidecar)));
+     string sidecartext;
+     LoadFile(p.sidecar, sidecartext);
+     // The JIT library's symbol table names every extern fn, so a new one
+     // rebuilds it.
+     auto externs = PackageExternNames(ast, pkg);
++    // The crates combined into this one's library bring their functions.
++    for (size_t other = 0; other < ast.packages.size(); other++)
++        if (ast.packages[other].cargo_owner == pkg)
++            for (auto &n : PackageExternNames(ast, (int)other))
++                if (std::find(externs.begin(), externs.end(), n) == externs.end()) externs.push_back(n);
++    // A crate's runtime hooks, which the program hands the runtime's to as
++    // it starts (CodeGen::EmitProgramInit).
++    if (!p.cargo_staticlib.empty() &&
++        std::find(externs.begin(), externs.end(), "goose_runtime_hooks") == externs.end())
++        externs.push_back("goose_runtime_hooks");
+     string externtext;
+     for (auto &n : externs) Append(externtext, n, "\n");
+     // The stamp: what the build was made from, then whether it holds the
+@@ -514,6 +527,35 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+         if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
+         return true;
+     }
++    if (!p.cargo_staticlib.empty()) {
++        // The crate's static library and the system libraries rustc says it
++        // needs, as a link takes them.
++        auto msvcstyle = b.tc.style == "msvc";
++        string rsp;
++        Append(rsp, msvcstyle ? "" : "\"", p.cargo_staticlib, msvcstyle ? "" : "\"", "\n");
++        for (auto &l : p.cargo_native_libs) Append(rsp, l, "\n");
++        if (!b.opts.dryrun && !WriteFileIfChanged(out.rsp, rsp))
++            throw CompileError { cat("cannot write ", out.rsp) };
++        if (wantjit) {
++            auto symsrc = cat(dir, "/goose_symbols.c");
++            auto symobj = cat(dir, msvcstyle ? "/goose_symbols.obj" : "/goose_symbols.o");
++            if (!b.opts.dryrun && !WriteFileMakingDirs(symsrc, SymbolTableSource(p.name, externs)))
++                throw CompileError { cat("cannot write ", symsrc) };
++            vector<string> symflags = { msvcstyle ? "/w" : "-w" };
++            #ifndef _WIN32
++                if (!msvcstyle) symflags.push_back("-fPIC");
++            #endif
++            if (!b.CompileObject(symsrc, symobj, cat("compiling the symbol table of the package ", p.name),
++                                 cat(dir, "/goose_symbols.cc.log"), symflags))
++                return false;
++            if (!b.LinkShared({ symobj, p.cargo_staticlib }, p.cargo_native_libs, out.jitlib, dir,
++                              cat(dir, "/jit.cc.log"),
++                              cat("building the package ", p.name, "'s library for the JIT")))
++                return false;
++        }
++        if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
++        return true;
++    }
+     // Where only the JIT library is missing, the objects already made from
+     // these inputs serve as they are: a link in another process may be
+     // reading them.
+diff --git a/src/packages.h b/src/packages.h
+index d8dabdb2..a5c49dcb 100644
+--- a/src/packages.h
++++ b/src/packages.h
+@@ -132,7 +132,8 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+     if (!pkg.hassidecar) return;
+     const char *lists[] = { "c_sources", "c_include", "c_defines", "c_flags_cc", "c_flags_msvc",
+                             "c_libs", "dylibs" };
+-    vector<string> known = { "cmake_target", "cmake_options", "main_thread_only", "exclude" };
++    vector<string> known = { "cmake_target", "cmake_options", "main_thread_only", "exclude",
++                             "cargo_crate", "cargo_features" };
+     for (auto key : lists)
+         for (auto suffix : { "", "_windows", "_linux", "_macos" }) known.push_back(cat(key, suffix));
+     if (isprogram) known.push_back("output");
+@@ -186,6 +187,17 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+     }
+     if (!pkg.csources.empty() && !pkg.cmake_target.empty())
+         throw CompileError { cat(pkg.sidecar, ": a package has either c_sources or a cmake_target") };
++    // A Rust crate (cargo.h): built now, so the module it writes is there
++    // for the imports the parse reaches next.
++    auto crate = bf.Str("cargo_crate");
++    if (!crate.empty()) {
++        if (!pkg.csources.empty() || !pkg.cmake_target.empty())
++            throw CompileError { cat(pkg.sidecar, ": a package has one of c_sources, cmake_target and "
++                                     "cargo_crate") };
++        pkg.cargo_crate = IsAbsoluteSource(crate) ? crate : ForwardSlashes(AbsolutePath(cat(pkg.root, crate)));
++        pkg.cargo_features = bf.Strings("cargo_features");
++        BuildCargoCrate(pkg);
++    }
+ }
+ 
+ // Removes a directory tree. A git checkout holds read-only files, which
+@@ -317,7 +329,9 @@ inline string PackageRoot(const PackageSource &source, const string &name) {
+     } else {
+         dir = FetchPackage(source, name);
+     }
+-    if (!PathExists(cat(dir, name, ".goose")))
++    // A package whose entry its crate's build writes (a sidecar naming a
++    // cargo_crate, Ferrous Goose 0005) has none until its sidecar loads.
++    if (!PathExists(cat(dir, name, ".goose")) && !PathExists(cat(dir, name, ".build")))
+         throw CompileError { cat("the package ", name, " at ", dir, " has no ", name, ".goose") };
+     return dir;
+ }
+-- 
+2.54.0
+

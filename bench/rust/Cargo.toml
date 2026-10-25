@@ -1,0 +1,16 @@
+[package]
+name = "goose-bench"
+description = "The per-call cost of Ferrous Goose's boundary checks, against bare extern calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+goose.workspace = true
+
+[package.metadata.goose]
+namespace = "bench"

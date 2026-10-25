@@ -1,0 +1,5 @@
+error: goose::export: a generic function needs instantiate(T = ...) to name the versions Goose may call
+ --> tests/ui/generic_without_instantiate.rs:2:13
+  |
+2 | pub fn first<T: Copy + Default>(xs: &[T]) -> T {
+  |             ^

@@ -1,0 +1,10 @@
+Hit is 24 bytes in Rust
+made: t=1.5 id=41 hit=true
+score 42.5 id 41
+bumped: t=3.0 id=42 hit=false
+text: Hit { t: 3, id: 42, hit: false }
+particle at 1.0,2.0,3.0 tag 9 history [0.125, 0.0, 0.5]
+pair sum 42
+swapped 39 3
+dot3 32.0
+scalar ref 42

@@ -1,0 +1,16 @@
+[package]
+name = "ferrous-goose-build"
+description = "Ferrous Goose for build.rs: compiles a Goose program and writes safe Rust bindings for its export fns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "goose_build"
+
+[dependencies]
+cc = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

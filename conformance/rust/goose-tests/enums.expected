@@ -1,0 +1,8 @@
+mode is fast: true
+levels 10 30
+raised to mid: true
+circle area true
+total 7.0
+grown: rect circle total true
+square rect 16.0
+tagged 12.0

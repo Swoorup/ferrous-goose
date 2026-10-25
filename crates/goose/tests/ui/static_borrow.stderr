@@ -1,0 +1,5 @@
+error: goose::export: a Goose argument is lent for the call only and cannot be 'static (spec §7.10)
+ --> tests/ui/static_borrow.rs:2:16
+  |
+2 | pub fn keep(s: &'static str) -> i64 {
+  |                ^^^^^^^^^^^^

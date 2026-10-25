@@ -1,0 +1,12 @@
+sum 10
+scaled [10, 20, 30, 40]
+Rust sees aligned slices: true, packed field true
+unaligned scaled and written back [3, 6, 9, 12] tag 1
+unaligned sum 30
+f64 sum 1.0
+nearest true id 42 at 1.25
+nearest of none false
+xor 96
+MAKE ME LOUD
+copied [7, 8, 9]
+owned 10

@@ -1,0 +1,317 @@
+From e225cba01ec8898f0f38b84fb620958b56e35b8a Mon Sep 17 00:00:00 2001
+From: Ferrous Goose <ferrous@goose.invalid>
+Date: Sun, 25 Oct 2026 19:30:14 +1100
+Subject: [PATCH 2/8] Export fns with several results and builder parameters
+ (Ferrous Goose 0002)
+
+The first result is C's return value and each further one an out-pointer;
+a builder parameter is a scratch builder the runtime keeps per parameter,
+whose elements and count the wrapper hands back, valid until the next
+exported call.
+---
+ docs/goose_spec.md    |  24 +++++--
+ src/codegen.h         |   1 +
+ src/codegen_emit.h    | 144 +++++++++++++++++++++++++++++++++++-------
+ src/ferrous.h         |   2 +-
+ src/typecheck.h       |   6 +-
+ src/typecheck_calls.h |  14 ++--
+ 6 files changed, 150 insertions(+), 41 deletions(-)
+
+diff --git a/docs/goose_spec.md b/docs/goose_spec.md
+index 659ba347..b114899a 100644
+--- a/docs/goose_spec.md
++++ b/docs/goose_spec.md
+@@ -2992,17 +2992,29 @@ export "c_sum" fn sum(a: i32, b: i32) -> i32 { a + b }
+ 
+ An `export fn` defines a normal Goose function and emits a C-callable wrapper.
+ The optional string names its C symbol; otherwise the function's leaf name is
+-used. Exported functions must be top-level, non-generic, have explicit
+-parameter types, and have at most one explicitly typed return value. Default
+-arguments, `return ... from`, reusable-pool parameters, and string-builder
+-parameters are not supported at the C boundary. Parameters otherwise use the
+-same fixed-size C shapes as §7.10.
++used. Exported functions must be top-level, non-generic, and have explicit
++parameter and return types. Default arguments, `return ... from`, and
++reusable-pool parameters are not supported at the C boundary. Parameters
++otherwise use the same fixed-size C shapes as §7.10.
++
++A builder parameter, `u8[>..]&` or `T[>..]&` of a flat fixed-size `T`, is
++not passed from C: the call gets an empty builder the runtime keeps for the
++purpose, one data stack per builder parameter, and the C wrapper takes in
++its place `const T **name` and `int64_t *name_len`, through which it hands
++back the elements the call appended and their count (either pointer may be
++null). The elements stay valid until the next exported call, which starts
++the scratch builders empty again.
+ 
+ Scalars and flat fixed-size returns are returned by value. A read-only
+ `const u8[:]` return is exposed as `const uint8_t *` and an additional
+ `int64_t *out_len` parameter; the returned bytes are not NUL-terminated, and
+ their storage remains borrowed according to the Goose function's lifetime.
+-Other references, slices, and variable-size returns are rejected.
++A function with several results returns the first so, and each further one
++through an out-pointer parameter after the parameters (and after the first
++result's `out_len`): `T *outN` for a fixed-size value, `const uint8_t
++**outN, int64_t *outN_len` for a `const u8[:]`; a null out-pointer drops
++that result. Other references, slices, and variable-size returns are
++rejected.
+ 
+ Generated C retains its normal `main` unless the program is compiled with
+ `--header out.h`, which builds it for a C host: the generated C has no `main`
+diff --git a/src/codegen.h b/src/codegen.h
+index 14dd29d0..26dd84eb 100644
+--- a/src/codegen.h
++++ b/src/codegen.h
+@@ -1419,6 +1419,7 @@ struct CodeGen {
+     void InitGlobalStack(VarDef *d);
+     void EmitProgramInit();
+     void EmitExports();
++    int64_t ExportScratchStacks();
+     string MainCall();
+     void EmitMain();
+ 
+diff --git a/src/codegen_emit.h b/src/codegen_emit.h
+index 3ccfe5ec..26773948 100644
+--- a/src/codegen_emit.h
++++ b/src/codegen_emit.h
+@@ -883,8 +883,8 @@ inline void CodeGen::EmitProgramInit() {
+     }
+     Append(code, "static void gs_program_init(int argc, char **argv) {\n"
+                  "    if (gs_program_initialized) return;\n"
+-                 "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
+-           ", ", workerregions, ");\n");
++                 "    gs_rt_init(argc, argv, ", mainstacks, ", ",
++           mainstacks + globalregions + ExportScratchStacks(), ", ", workerregions, ");\n");
+     // The shared libraries' functions, before a global's initializer could
+     // call one: on the main thread, before any worker exists, so the
+     // pointers are written once here and read thereafter without
+@@ -919,45 +919,141 @@ inline string CodeGen::MainCall() {
+     return cat("    ", mi.cname, "(", mi.needssp ? "0" : "", ");\n");
+ }
+ 
++// Whether an export's parameter is a builder (T[>..]&), which the C
++// wrapper replaces with the runtime's scratch builder for the call.
++static inline bool IsExportBuilder(TypeExpr *t) {
++    return t->kind == TY_REF && t->ref->sub->kind == TY_ARRAY && t->ref->sub->arr->akind == A_GROW;
++}
++
++// The scratch builders exports need: one data stack per builder parameter
++// of the export with the most, each holding one call's elements until the
++// next exported call starts.
++inline int64_t CodeGen::ExportScratchStacks() {
++    int64_t most = 0;
++    for (auto sf : ast.functions) {
++        if (!sf->isexport || sf->specs.size() != 1) continue;
++        int64_t n = 0;
++        for (auto t : sf->specs[0]->argtypes) n += IsExportBuilder(t);
++        most = std::max(most, n);
++    }
++    return most;
++}
++
++// The C wrapper of each export fn (§7.11): its parameters in their C
++// shapes, a builder parameter as the elements and count the call left in a
++// scratch builder (`const T **name, int64_t *name_len`, valid until the next
++// exported call), the first result as the C return value (a `const u8[:]`
++// as a pointer and a trailing `int64_t *` length) and every further result
++// through a trailing out-pointer.
+ inline void CodeGen::EmitExports() {
++    auto scratch = ExportScratchStacks();
++    if (scratch)
++        Append(code, "static gs_stack gs_export_scratch[", scratch, "];\n"
++                     "static uint8_t *gs_export_scratch_base[", scratch, "];\n\n");
+     for (auto sf : ast.functions) {
+         if (!sf->isexport) continue;
+         if (sf->specs.size() != 1 || !sinfo.count(sf->specs[0]))
+             Fail(sf->line, cat("export fn ", sf->name, " has no emitted specialization"));
+         auto sp = sf->specs[0];
+         auto &si = sinfo[sp];
+-        auto returnslice = !sp->rets.empty() && sp->rets[0]->kind == TY_SLICE;
+-        string params, args;
+-        vector<string> argv;
++        string body, after;
++        vector<string> argv, pparams, rparams;
++        auto addp = [&](const string &p) { pparams.push_back(p); };
++        int64_t k = 0;
+         for (size_t i = 0; i < sp->argtypes.size(); i++) {
++            auto t = sp->argtypes[i];
+             auto arg = Unique(cat("gs_export_arg", i));
+-            Append(params, params.empty() ? "" : ", ", CT(sp->argtypes[i]), " ", arg);
+-            PushArg(argv, sp->argtypes[i], IsPoolParam(sp, i), arg);
++            if (IsExportBuilder(t)) {
++                auto elem = t->ref->sub->arr->sub;
++                auto et = IsU8(elem) ? string("uint8_t") : CT(elem);
++                auto hdr = Unique(cat("gs_export_hdr", i));
++                auto lenp = Unique(cat("gs_export_len", i));
++                addp(cat("const ", et, " **", arg, "_data, int64_t *", lenp));
++                Append(body,
++                       "    if (!gs_export_scratch_base[", k, "]) {\n"
++                       "        gs_stack_init(&gs_export_scratch[", k, "]);\n"
++                       "        gs_export_scratch_base[", k, "] = gs_export_scratch[", k, "].top;\n"
++                       "    }\n"
++                       "    gs_export_scratch[", k, "].top = gs_export_scratch_base[", k, "];\n"
++                       "    gs_rhdr ", hdr, " = { gs_export_scratch_base[", k, "], 0 };\n"
++                       "    gs_rref ", arg, " = { &", hdr, ", &gs_export_scratch[", k, "] };\n");
++                Append(after, "    if (", arg, "_data) *", arg, "_data = (const ", et, " *)", hdr,
++                       ".base;\n    if (", lenp, ") *", lenp, " = ", hdr, ".len;\n");
++                k++;
++            } else {
++                addp(cat(CT(t), " ", arg));
++            }
++            PushArg(argv, t, IsPoolParam(sp, i), arg);
++        }
++        // The results: the C-returned one, and the others through
++        // temporaries the specialization writes (C.3).
++        string ret = "void";
++        vector<string> outs(sp->rets.size());
++        for (size_t r = 0; r < sp->rets.size(); r++) {
++            auto t = sp->rets[r];
++            auto isslice = t->kind == TY_SLICE;
++            if (r == 0) {
++                if (isslice) {
++                    ret = "const uint8_t *";
++                } else {
++                    ret = CT(t);
++                }
++                continue;
++            }
++            auto out = Unique(cat("gs_export_out", r));
++            if (isslice) rparams.push_back(cat("const uint8_t **", out, ", int64_t *", out, "_len"));
++            else rparams.push_back(cat(CT(t), " *", out));
++            outs[r] = out;
+         }
+-        for (auto &a : argv) Append(args, args.empty() ? "" : ", ", a);
+         auto outlen = Unique("gs_export_len");
+-        if (returnslice) Append(params, params.empty() ? "" : ", ", "int64_t *", outlen);
++        auto slice0 = !sp->rets.empty() && sp->rets[0]->kind == TY_SLICE;
++        // The parameters, the first result's length, the further results.
++        if (slice0) pparams.push_back(cat("int64_t *", outlen));
++        for (auto &r : rparams) pparams.push_back(r);
++        string params;
++        for (auto &pp : pparams) Append(params, params.empty() ? "" : ", ", pp);
++        vector<string> rettemps(sp->rets.size());
++        for (size_t r = 0; r < sp->rets.size(); r++) {
++            if ((int)r == si.cret) continue;
++            auto tv = Unique(cat("gs_export_ret", r));
++            Append(body, "    ", CT(sp->rets[r]), " ", tv, ";\n");
++            rettemps[r] = tv;
++            argv.push_back(cat("&", tv));
++        }
++        if (si.needssp) argv.push_back("0");
++        string args;
++        for (auto &a : argv) Append(args, args.empty() ? "" : ", ", a);
+         if (params.empty()) params = "void";
+-        if (!args.empty() && si.needssp) args += ", ";
+-        if (si.needssp) args += "0";
+-        auto ret = sp->rets.empty() ? string("void")
+-                   : returnslice ? string("const uint8_t *") : CT(sp->rets[0]);
+         Append(exportprotos, ret, " ", sf->cname, "(", params, ");\n");
+         Append(code, ret, " ", sf->cname, "(", params, ") {\n"
+                      "    if (!gs_program_initialized)\n"
+                      "        gs_panic(\"goose_init must be called before exported functions\");\n");
+-        if (returnslice) {
+-            auto value = Unique("gs_export_result");
+-            Append(code, "    if (!", outlen,
+-                   ") gs_panic(\"exported slice length pointer is null\");\n");
+-            Append(code, "    ", CT(sp->rets[0]), " ", value, " = ", si.cname, "(", args,
+-                   ");\n"
+-                   "    *", outlen, " = ", value, ".len;\n"
+-                   "    return (const uint8_t *)", value, ".data;\n");
+-        } else if (sp->rets.empty()) {
+-            Append(code, "    ", si.cname, "(", args, ");\n");
++        if (slice0)
++            Append(code, "    if (!", outlen, ") gs_panic(\"exported slice length pointer is null\");\n");
++        code += body;
++        string r0;
++        if (si.cret >= 0) {
++            r0 = Unique("gs_export_result");
++            Append(code, "    ", CT(sp->rets[si.cret]), " ", r0, " = ", si.cname, "(", args, ");\n");
++            rettemps[si.cret] = r0;
+         } else {
+-            Append(code, "    return ", si.cname, "(", args, ");\n");
++            Append(code, "    ", si.cname, "(", args, ");\n");
++        }
++        code += after;
++        for (size_t r = 1; r < sp->rets.size(); r++) {
++            auto &o = outs[r];
++            if (sp->rets[r]->kind == TY_SLICE)
++                Append(code, "    if (", o, ") *", o, " = (const uint8_t *)", rettemps[r],
++                       ".data;\n    if (", o, "_len) *", o, "_len = ", rettemps[r], ".len;\n");
++            else
++                Append(code, "    if (", o, ") *", o, " = ", rettemps[r], ";\n");
++        }
++        if (!sp->rets.empty()) {
++            if (slice0)
++                Append(code, "    *", outlen, " = ", rettemps[0], ".len;\n"
++                             "    return (const uint8_t *)", rettemps[0], ".data;\n");
++            else
++                Append(code, "    return ", rettemps[0], ";\n");
+         }
+         Append(code, "}\n\n");
+     }
+diff --git a/src/ferrous.h b/src/ferrous.h
+index 027d5caf..8ed6a6ff 100644
+--- a/src/ferrous.h
++++ b/src/ferrous.h
+@@ -3,4 +3,4 @@
+ // lists so that cargo goose and goose_build know what the compiler can do.
+ #pragma once
+ 
+-#define FERROUS_FEATURES "typed-builders"
++#define FERROUS_FEATURES "typed-builders export-results"
+diff --git a/src/typecheck.h b/src/typecheck.h
+index f13bb5a4..52dc8dd9 100644
+--- a/src/typecheck.h
++++ b/src/typecheck.h
+@@ -3200,7 +3200,9 @@ struct TypeCheck {
+             RootArg noview;
+             noview.cls = -1;
+             auto holder = !IsRefOrSlice(t) && HoldsPlainRef(t);
+-            if (auto pool = poolfor(t)) {
++            // An export's builder is the runtime's scratch builder for the
++            // call (§7.11), never a pool's.
++            if (auto pool = sf->isexport ? nullptr : poolfor(t)) {
+                 auto &cls = poolclasses[pool];
+                 if (!cls) cls = ++classes;
+                 ra.cls = cls;
+@@ -3226,7 +3228,7 @@ struct TypeCheck {
+             }
+             if (IsRefOrSlice(t)) {
+                 ra.writable = true;
+-                if (CarriesPool(t) && ClassOf(t->ref->sub->arr->sub) == SC_FIXED)
++                if (CarriesPool(t) && ClassOf(t->ref->sub->arr->sub) == SC_FIXED && !sf->isexport)
+                     ra.reusable = RU_SLOTS | RU_SLICES;
+                 // Its class's storage is a value of the type it refers to.
+                 if (t->kind == TY_REF) {
+diff --git a/src/typecheck_calls.h b/src/typecheck_calls.h
+index 274a23a2..c25f421b 100644
+--- a/src/typecheck_calls.h
++++ b/src/typecheck_calls.h
+@@ -2704,19 +2704,17 @@ inline void TypeCheck::CheckExport(SFunction *sf) {
+         if (!ExternParamOk(t, why))
+             fail(cat("parameter ", sf->params[i].name, " of type ", TypeStr(t),
+                      " cannot cross to C: ", why));
+-        if (CarriesPool(t))
++        // A builder that is a reusable pool's carries the pool, which C has
++        // no form of; any other builder is the scratch one (EmitExports).
++        if (CarriesPool(t) && i < spec->roots.size() && spec->roots[i].reusable)
+             fail(cat("parameter ", sf->params[i].name,
+                      " uses a reusable pool and has no public C representation"));
+-        if (t->kind == TY_REF && t->ref->sub->kind == TY_ARRAY &&
+-            t->ref->sub->arr->akind == A_GROW)
+-            fail(cat("parameter ", sf->params[i].name,
+-                     IsU8(t->ref->sub->arr->sub) ? " is a Goose string builder"
+-                                                 : " is a Goose builder",
+-                     " and cannot be passed from C"));
++        // A builder is the runtime's scratch builder for the call, whose
++        // elements C reads afterwards (EmitExports): it cannot come from C.
+     }
+-    if (spec->rets.size() > 1) fail("returns at most one value");
+     if (!sf->has_rets && !spec->rets.empty())
+         fail("a returned value needs an explicit return type");
++    // The first result is C's return value, the others out-pointers.
+     for (auto t : spec->rets) {
+         ValidateType(t, sf->line, VT_LOCAL);
+         if (t->kind == TY_SLICE && IsU8(t->sub)) {
+-- 
+2.54.0
+

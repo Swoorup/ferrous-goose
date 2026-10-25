@@ -1,0 +1,3 @@
+// The crate is built and linked into the program (goose-patches/0005):
+// goose run and goose build need nothing else.
+cargo_crate = "../rust";

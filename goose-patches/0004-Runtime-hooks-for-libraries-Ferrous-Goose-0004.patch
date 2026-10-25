@@ -1,0 +1,684 @@
+From 4a5d1f13a3df66ee1066ca3ab39753ceb68568a8 Mon Sep 17 00:00:00 2001
+From: Ferrous Goose <ferrous@goose.invalid>
+Date: Sun, 25 Oct 2026 19:39:39 +1100
+Subject: [PATCH 4/8] Runtime hooks for libraries (Ferrous Goose 0004)
+
+A library an extern block opens that exports goose_runtime_hooks is handed
+the runtime's abort, which ends a contained worker alone, and at_end, which
+has a function called as the program ends.
+---
+ docs/goose_spec.md         |   8 +-
+ src/codegen_emit.h         |   2 +-
+ src/ferrous.h              |   2 +-
+ src/runtime/goose.h        |  11 +++
+ src/runtime/runtime.h      |  18 +++-
+ src/runtime/runtime_ext.h  |   9 ++
+ src/runtime/runtime_impl.h |  27 +++++-
+ src/runtime/runtime_os.h   |   3 +
+ src/runtime_inline.h       | 165 +++++++++++++++++++++++++------------
+ 9 files changed, 184 insertions(+), 61 deletions(-)
+
+diff --git a/docs/goose_spec.md b/docs/goose_spec.md
+index b0ff6c2c..7c1d990d 100644
+--- a/docs/goose_spec.md
++++ b/docs/goose_spec.md
+@@ -2971,7 +2971,13 @@ cannot load SDL2 (libSDL2.so): libSDL2.so: cannot open shared object file: No su
+ SDL2 (libSDL2.so) has no symbol SDL_Foo
+ ```
+ 
+-A library is never closed. A `main_thread_only` package (docs/packages.md)
++A library that exports `void goose_runtime_hooks(const gs_rt_hooks *)` is
++handed the runtime's hooks as it is opened (`goose.h` declares the struct):
++`abort_msg(msg, len, file, line)`, which ends the program exactly as
++`abort(msg)` does, or only the worker in a contained one (§11.2), and
++`at_end(fn)`, which has the runtime call `fn` when the program ends, by a
++return from `main` or by `exit`. A library never sees a hook it did not ask
++for. A library is never closed. A `main_thread_only` package (docs/packages.md)
+ applies to its block's members as to its other externs. A variadic C
+ function cannot be bound: the declaration has no way to say so, and
+ calling one through a fixed-arity pointer is undefined. The generated C is
+diff --git a/src/codegen_emit.h b/src/codegen_emit.h
+index 26773948..021025c7 100644
+--- a/src/codegen_emit.h
++++ b/src/codegen_emit.h
+@@ -1074,7 +1074,7 @@ inline string CodeGen::ExportHeader() {
+ 
+ inline void CodeGen::EmitMain() {
+     Append(code, "int main(int argc, char **argv) {\n    gs_program_init(argc, argv);\n",
+-           MainCall(), "    gs_rt_stats();\n    return 0;\n}\n");
++           MainCall(), "    gs_rt_stats();\n    gs_rt_end_hooks();\n    return 0;\n}\n");
+ }
+ 
+ }  // namespace goose
+diff --git a/src/ferrous.h b/src/ferrous.h
+index df70dd75..abced685 100644
+--- a/src/ferrous.h
++++ b/src/ferrous.h
+@@ -3,4 +3,4 @@
+ // lists so that cargo goose and goose_build know what the compiler can do.
+ #pragma once
+ 
+-#define FERROUS_FEATURES "typed-builders export-results emit-interface"
++#define FERROUS_FEATURES "typed-builders export-results emit-interface runtime-hooks"
+diff --git a/src/runtime/goose.h b/src/runtime/goose.h
+index 3819ad62..2ae6bd69 100644
+--- a/src/runtime/goose.h
++++ b/src/runtime/goose.h
+@@ -38,6 +38,17 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+     b.hdr->len += n;
+ }
+ 
++/* The runtime's hooks, which a library that exports
++   `void goose_runtime_hooks(const gs_rt_hooks *)` is handed as the program
++   opens it (spec 7.10): abort_msg ends the program as abort(msg) does, or
++   only the worker in a contained one; at_end has a function called as the
++   program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++} gs_rt_hooks;
++
+ /* Appends `count` elements of `size` bytes each to the T[>..] a typed
+    builder points at (spec 7.10): the bytes are the elements as Goose lays
+    them out, packed, and the header counts elements, not bytes. */
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 596ef768..876788fc 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -181,6 +181,19 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
+ GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
+                                      int line);
+ GS_API GS_NORETURN void gs_exit(int64_t code);
++/* What a library an extern block opens may take from the runtime: one that
++   exports goose_runtime_hooks gets them as it is opened (gs_dl_bind), one
++   linked into the program as the program starts. abort_msg ends the program
++   as abort(msg) does, or only the worker in a contained one; at_end has the
++   runtime call a function when the program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++} gs_rt_hooks;
++GS_API void gs_at_end(void (*fn)(void));
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *));
++GS_API void gs_rt_end_hooks(void);
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line);
+ GS_API GS_NORETURN void gs_divfail(const char *file, int line);
+ GS_API GS_NORETURN void gs_divovf(const char *file, int line);
+@@ -812,8 +825,9 @@ typedef struct {
+ } gs_stack;
+ 
+ /* The program defines what goose.h gives C compiled on its own (gs_stack
+-   here, gs_rhdr, gs_rref and gs_bld_append after the generated types), so
+-   an --include header including it gets nothing more. */
++   here, gs_rhdr, gs_rref, gs_bld_append and gs_bld_push after the generated
++   types, gs_rt_hooks with the aborts), so an --include header including it
++   gets nothing more. */
+ #define GOOSE_H 1
+ 
+ /* Starts the runtime on main's thread: the program's arguments, each
+diff --git a/src/runtime/runtime_ext.h b/src/runtime/runtime_ext.h
+index 241432b5..18c0086a 100644
+--- a/src/runtime/runtime_ext.h
++++ b/src/runtime/runtime_ext.h
+@@ -26,6 +26,15 @@ static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+     b.hdr->len += n;
+ }
+ 
++/* Appends count elements of size bytes each to the T[>..] a typed builder
++   points at (spec 7.10, Ferrous Goose 0001): the header counts elements. */
++static void gs_bld_push(gs_rref b, const void *p, int64_t count, int64_t size) {
++    if (count <= 0) return;
++    memcpy(b.stk->top, p, (size_t)(count * size));
++    b.stk->top += count * size;
++    b.hdr->len += count;
++}
++
+ /* ffi's cstr and bytes (stdlib/ffi.goose): the bytes at a pointer a C
+    library handed back as a u64, copied into a builder, so nothing foreign
+    is a Goose value without a copy. The pointer is trusted as every extern
+diff --git a/src/runtime/runtime_impl.h b/src/runtime/runtime_impl.h
+index 890cb70b..2fe9ecd5 100644
+--- a/src/runtime/runtime_impl.h
++++ b/src/runtime/runtime_impl.h
+@@ -68,18 +68,20 @@ static GS_TLS gs_contained *gs_contain;
+ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, int line) {
+     static const char lead[] = "goose runtime error: ";
+     int64_t pre = sizeof lead - 1;
+-    int64_t loc = snprintf(NULL, 0, " (%s:%d)\n", file, line);
++    /* A place with no line (a library's own, gs_rt_hooks) is named alone. */
++    const char *locfmt = line > 0 ? " (%s:%d)\n" : " (%s)\n";
++    int64_t loc = snprintf(NULL, 0, locfmt, file, line);
+     uint8_t *text = (uint8_t *)malloc((size_t)(pre + len + loc + 1));
+     if (!text) {
+         if (gs_contain) gs_panic("out of memory recording an aborted thread");
+         fputs(lead, stderr);
+         fwrite(msg, 1, (size_t)len, stderr);
+-        fprintf(stderr, " (%s:%d)\n", file, line);
++        fprintf(stderr, locfmt, file, line);
+         gs_end(1);
+     }
+     memcpy(text, lead, (size_t)pre);
+     if (len) memcpy(text + pre, msg, (size_t)len);
+-    snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
++    snprintf((char *)text + pre + len, (size_t)loc + 1, locfmt, file, line);
+     if (gs_contain) {
+         memmove(text, text + pre, (size_t)(len + loc - 1));
+         gs_contain->msg = text;
+@@ -113,6 +115,24 @@ GS_API GS_NORETURN void gs_exit(int64_t code) {
+     gs_end((int)code);
+ }
+ 
++/* The functions libraries asked to have called as the program ends
++   (gs_rt_hooks), each once, from the first thread that ends it. */
++static void (*gs_end_fns[16])(void);
++static int gs_nend_fns;
++
++GS_API void gs_at_end(void (*fn)(void)) {
++    if (gs_nend_fns < 16) gs_end_fns[gs_nend_fns++] = fn;
++}
++
++GS_API void gs_rt_end_hooks(void) {
++    while (gs_nend_fns > 0) gs_end_fns[--gs_nend_fns]();
++}
++
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *)) {
++    static const gs_rt_hooks hooks = { 1, gs_abort_msg, gs_at_end };
++    hook(&hooks);
++}
++
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line) {
+     gs_failf(file, line, "index %lld out of bounds (length %lld)", (long long)i, (long long)n);
+ }
+@@ -617,6 +637,7 @@ static GS_NORETURN void gs_park(void) {
+ 
+ static GS_NORETURN void gs_end(int code) {
+     if (!gs_end_first()) gs_park();
++    gs_rt_end_hooks();
+     fflush(NULL);
+     #ifdef __TINYC__
+         if (gs_current_thread_id < 0) exit(code);
+diff --git a/src/runtime/runtime_os.h b/src/runtime/runtime_os.h
+index dc6d8dc8..f33914f2 100644
+--- a/src/runtime/runtime_os.h
++++ b/src/runtime/runtime_os.h
+@@ -588,6 +588,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      spelling, (unsigned)GetLastError());
+             gs_panic(msg);
+         }
++        void *hooks = (void *)GetProcAddress(h, "goose_runtime_hooks");
+ #else
+         void *h = dlopen(spelling, RTLD_NOW | RTLD_LOCAL);
+         if (!h) {
+@@ -596,7 +597,9 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      why ? why : "unknown error");
+             gs_panic(msg);
+         }
++        void *hooks = dlsym(h, "goose_runtime_hooks");
+ #endif
++        if (hooks) gs_rt_give_hooks((void (*)(const gs_rt_hooks *))hooks);
+         for (int64_t b = 0; b < nbinds; b++) {
+             if (binds[b].lib != l) continue;
+ #ifdef _WIN32
+diff --git a/src/runtime_inline.h b/src/runtime_inline.h
+index 8dc9e0f5..eb4d05c2 100644
+--- a/src/runtime_inline.h
++++ b/src/runtime_inline.h
+@@ -193,10 +193,23 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
+ GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
+                                      int line);
+ GS_API GS_NORETURN void gs_exit(int64_t code);
++/* What a library an extern block opens may take from the runtime: one that
++   exports goose_runtime_hooks gets them as it is opened (gs_dl_bind), one
++)GSRT"
++R"GSRT(   linked into the program as the program starts. abort_msg ends the program
++   as abort(msg) does, or only the worker in a contained one; at_end has the
++   runtime call a function when the program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++} gs_rt_hooks;
++GS_API void gs_at_end(void (*fn)(void));
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *));
++GS_API void gs_rt_end_hooks(void);
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line);
+ GS_API GS_NORETURN void gs_divfail(const char *file, int line);
+-)GSRT"
+-R"GSRT(GS_API GS_NORETURN void gs_divovf(const char *file, int line);
++GS_API GS_NORETURN void gs_divovf(const char *file, int line);
+ /* The debug build's failing overflow and `as` checks. */
+ GS_API GS_NORETURN void gs_ovf(int64_t a, const char *op, int64_t b, const char *type,
+                                const char *file, int line);
+@@ -338,7 +351,8 @@ static inline int gs_simd_level(void) {
+ #else
+ #define GS_MEMCPY(d, s, n) memcpy((d), (s), (n))
+ #define GS_MEMZERO(d, n) memset((d), 0, (n))
+-#endif
++)GSRT"
++R"GSRT(#endif
+ 
+ /* Unaligned loads of 4 and 8 bytes. */
+ #ifdef __TINYC__
+@@ -356,8 +370,7 @@ static uint64_t gs_bytemask(int64_t k) {
+ }
+ 
+ /* memcpy, memmove and memcmp for a slice's elements. An empty slice's data
+-)GSRT"
+-R"GSRT(   pointer is NULL where the slice was zero-filled (default<T>(), a default
++   pointer is NULL where the slice was zero-filled (default<T>(), a default
+    element), and C leaves all three undefined on a null pointer even for
+    zero bytes. A copy of up to 16 bytes loads both overlapping halves before
+    it stores them, and one of up to 256 bytes moves 16 at a time, the last 16
+@@ -508,7 +521,8 @@ GS_DIVOPS_S(i32, int32_t, INT32_MIN, INT32_MAX)
+ #define GS_INTOPS_S(SFX, T, MIN, MAX, BITS) \
+ static T gs_add_##SFX(T a, T b, const char *file, int line) { \
+     int64_t r = (int64_t)a + (int64_t)b; \
+-    if (r < MIN || r > MAX) gs_ovf(a, "+", b, #SFX, file, line); \
++)GSRT"
++R"GSRT(    if (r < MIN || r > MAX) gs_ovf(a, "+", b, #SFX, file, line); \
+     return (T)r; } \
+ static T gs_sub_##SFX(T a, T b, const char *file, int line) { \
+     int64_t r = (int64_t)a - (int64_t)b; \
+@@ -523,8 +537,7 @@ static T gs_neg_##SFX(T a, const char *file, int line) { \
+     if (r < MIN || r > MAX) gs_ovf_neg(a, #SFX, file, line); \
+     return (T)r; } \
+ static T gs_shl_##SFX(T a, int64_t n) { \
+-)GSRT"
+-R"GSRT(    return (T)((uint64_t)a << (n & (BITS - 1))); } \
++    return (T)((uint64_t)a << (n & (BITS - 1))); } \
+ static T gs_shr_##SFX(T a, int64_t n) { \
+     return (T)((int64_t)a >> (n & (BITS - 1))); }
+ 
+@@ -685,7 +698,8 @@ static uint64_t gs_divu_gen(uint64_t d, uint8_t *more) {
+     if (!(d & (d - 1))) { *more = (uint8_t)k; return 0; }
+     /* floor(2^(64+k) / d), which fits since d > 2^k; then the smallest
+        power that works, or the 65-bit form one past it. */
+-    m = gs_div128_u64((uint64_t)1 << k, d, &rem);
++)GSRT"
++R"GSRT(    m = gs_div128_u64((uint64_t)1 << k, d, &rem);
+     if (d - rem < ((uint64_t)1 << k)) {
+         *more = (uint8_t)k;
+     } else {
+@@ -711,8 +725,7 @@ static uint64_t gs_divu_q(uint64_t x, uint64_t magic, uint8_t more) {
+     return q >> more;
+ #else
+     (void)magic;
+-)GSRT"
+-R"GSRT(    return x >> more;   /* Never called: GS_DIVU_NONE takes the operator. */
++    return x >> more;   /* Never called: GS_DIVU_NONE takes the operator. */
+ #endif
+ }
+ 
+@@ -828,8 +841,9 @@ typedef struct {
+ } gs_stack;
+ 
+ /* The program defines what goose.h gives C compiled on its own (gs_stack
+-   here, gs_rhdr, gs_rref and gs_bld_append after the generated types), so
+-   an --include header including it gets nothing more. */
++   here, gs_rhdr, gs_rref, gs_bld_append and gs_bld_push after the generated
++   types, gs_rt_hooks with the aborts), so an --include header including it
++   gets nothing more. */
+ #define GOOSE_H 1
+ 
+ /* Starts the runtime on main's thread: the program's arguments, each
+@@ -875,7 +889,8 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+ /* ---------------------------------------------------------------------------
+    Threads and typed queues (§11.2), runtime_threads.h. */
+ 
+-GS_API int64_t gs_hardware_threads(void);
++)GSRT"
++R"GSRT(GS_API int64_t gs_hardware_threads(void);
+ /* Runs run(entry, args) and then release() on a new thread, args a copy of
+    argsize bytes, and returns the worker's id. In a contained worker an
+    abort ends run early. */
+@@ -886,8 +901,7 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
+    `msg` is not NULL, the first such wait for a worker that aborted takes its
+    message: `msg` and `len` are set to it, which the caller frees with
+    gs_free_msg, or to NULL and no bytes. */
+-)GSRT"
+-R"GSRT(GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
++GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
+                                const char *file, int line);
+ GS_API void gs_free_msg(uint8_t *msg);
+ 
+@@ -1071,7 +1085,8 @@ static int64_t gs_zig_write(uint8_t *p, int64_t v) {
+ 
+ /* ---------------------------------------------------------------------------
+    Verified loading (docs/design/serialization.md): what the generated
+-   gs_verify_<T> walkers are built from. The bytes are untrusted until the
++)GSRT"
++R"GSRT(   gs_verify_<T> walkers are built from. The bytes are untrusted until the
+    walk finishes, so every read here is bounded by the image end and reports
+    a malformed encoding instead of running past it. */
+ 
+@@ -1087,8 +1102,7 @@ static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out
+         b = *q++;
+         if (shift > 63 || (shift == 63 && (b & 0x7e))) return 0;
+         v |= (uint64_t)(b & 0x7f) << shift;
+-)GSRT"
+-R"GSRT(        if (!(b & 0x80)) {
++        if (!(b & 0x80)) {
+             if (shift && !b) return 0;  /* Redundant high zero group. */
+             break;
+         }
+@@ -1223,18 +1237,20 @@ static GS_TLS gs_contained *gs_contain;
+ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, int line) {
+     static const char lead[] = "goose runtime error: ";
+     int64_t pre = sizeof lead - 1;
+-    int64_t loc = snprintf(NULL, 0, " (%s:%d)\n", file, line);
++    /* A place with no line (a library's own, gs_rt_hooks) is named alone. */
++    const char *locfmt = line > 0 ? " (%s:%d)\n" : " (%s)\n";
++    int64_t loc = snprintf(NULL, 0, locfmt, file, line);
+     uint8_t *text = (uint8_t *)malloc((size_t)(pre + len + loc + 1));
+     if (!text) {
+         if (gs_contain) gs_panic("out of memory recording an aborted thread");
+         fputs(lead, stderr);
+         fwrite(msg, 1, (size_t)len, stderr);
+-        fprintf(stderr, " (%s:%d)\n", file, line);
++        fprintf(stderr, locfmt, file, line);
+         gs_end(1);
+     }
+     memcpy(text, lead, (size_t)pre);
+     if (len) memcpy(text + pre, msg, (size_t)len);
+-    snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
++    snprintf((char *)text + pre + len, (size_t)loc + 1, locfmt, file, line);
+     if (gs_contain) {
+         memmove(text, text + pre, (size_t)(len + loc - 1));
+         gs_contain->msg = text;
+@@ -1268,6 +1284,24 @@ GS_API GS_NORETURN void gs_exit(int64_t code) {
+     gs_end((int)code);
+ }
+ 
++/* The functions libraries asked to have called as the program ends
++   (gs_rt_hooks), each once, from the first thread that ends it. */
++static void (*gs_end_fns[16])(void);
++static int gs_nend_fns;
++
++GS_API void gs_at_end(void (*fn)(void)) {
++    if (gs_nend_fns < 16) gs_end_fns[gs_nend_fns++] = fn;
++}
++
++GS_API void gs_rt_end_hooks(void) {
++    while (gs_nend_fns > 0) gs_end_fns[--gs_nend_fns]();
++}
++
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *)) {
++    static const gs_rt_hooks hooks = { 1, gs_abort_msg, gs_at_end };
++    hook(&hooks);
++}
++
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line) {
+     gs_failf(file, line, "index %lld out of bounds (length %lld)", (long long)i, (long long)n);
+ }
+@@ -1333,7 +1367,8 @@ static char **gs_argv;
+ /* What a new region reserves: the usable part, which halves whenever the
+    platform refuses one (gs_reserve_region), and the guard gap behind it;
+    the usable part as configured, for the reports; and the page size, a
+-   whole number of which the usable part always is (gs_rt_start). */
++)GSRT"
++R"GSRT(   whole number of which the usable part always is (gs_rt_start). */
+ static size_t gs_region_usable, gs_region_gap, gs_region_reserve, gs_region_page;
+ /* The worker running on this thread, main's being -1 (runtime_threads.h). */
+ static GS_TLS int64_t gs_current_thread_id = -1;
+@@ -1346,8 +1381,7 @@ static int64_t gs_mainregions, gs_workerregions;
+ static int64_t gs_thread_cap = INT64_MAX;
+ 
+ /* A region's own sizes travel with it: those reserved before a refusal
+-)GSRT"
+-R"GSRT(   halved the size are larger than those after. */
++   halved the size are larger than those after. */
+ typedef struct {
+     uint8_t *base;
+     size_t usable, size;    /* size: with the guard gap */
+@@ -1537,7 +1571,8 @@ static void gs_native_stack_init(void) {
+ static void gs_native_stack_free(void) {}
+ 
+ /* Address space for one region, or NULL where the platform has none left
+-   to give: nothing is committed until the fault handler is asked. */
++)GSRT"
++R"GSRT(   to give: nothing is committed until the fault handler is asked. */
+ static uint8_t *gs_os_reserve(size_t usable, size_t size) {
+     (void)usable;
+     return (uint8_t *)VirtualAlloc(0, size, MEM_RESERVE, PAGE_READWRITE);
+@@ -1561,8 +1596,7 @@ static GS_NORETURN void gs_park(void) {
+ 
+ #include <sys/mman.h>
+ #include <unistd.h>
+-)GSRT"
+-R"GSRT(#include <signal.h>
++#include <signal.h>
+ #include <pthread.h>
+ 
+ /* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
+@@ -1736,7 +1770,8 @@ static uint8_t *gs_os_reserve(size_t usable, size_t size) {
+     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS
+                    #ifdef MAP_NORESERVE
+-                       | MAP_NORESERVE
++)GSRT"
++R"GSRT(                       | MAP_NORESERVE
+                    #endif
+                    , -1, 0);
+     if (p == MAP_FAILED) return NULL;
+@@ -1757,8 +1792,7 @@ static void gs_release_region(const gs_region *r) {
+     if (munmap(r->base, r->size)) gs_panic("cannot release data stack address space");
+ }
+ 
+-)GSRT"
+-R"GSRT(/* Whether this is the first call of gs_end; and where the later ones wait.
++/* Whether this is the first call of gs_end; and where the later ones wait.
+    TinyCC names the memory orders in its stdatomic.h alone. */
+ #ifndef __ATOMIC_SEQ_CST
+ #define __ATOMIC_SEQ_CST 5
+@@ -1775,6 +1809,7 @@ static GS_NORETURN void gs_park(void) {
+ 
+ static GS_NORETURN void gs_end(int code) {
+     if (!gs_end_first()) gs_park();
++    gs_rt_end_hooks();
+     fflush(NULL);
+     #ifdef __TINYC__
+         if (gs_current_thread_id < 0) exit(code);
+@@ -1917,7 +1952,8 @@ GS_API uint8_t gs_trim_memory(void) {
+    of the one before: no freelist gets this deep. */
+ #define GS_SPAN_DEPTH 24
+ 
+-/* `link` chains emptied nodes. */
++)GSRT"
++R"GSRT(/* `link` chains emptied nodes. */
+ typedef struct { int64_t n, link, idx[GS_SPAN_LEAF], cnt[GS_SPAN_LEAF]; } gs_spleaf;
+ typedef struct { int64_t n, link, key[GS_SPAN_FAN], max[GS_SPAN_FAN], child[GS_SPAN_FAN]; } gs_spinner;
+ typedef struct { int64_t root, height, chain; } gs_sphead;
+@@ -1935,8 +1971,7 @@ typedef struct {
+ #define GS_SPLEAF(p, i) ((gs_spleaf *)((p)->base + (i) * GS_SPAN_NODE))
+ #define GS_SPINNER(p, i) ((gs_spinner *)((p)->base + (i) * GS_SPAN_NODE))
+ 
+-)GSRT"
+-R"GSRT(static int64_t gs_sp_newnode(gs_sppath *p) {
++static int64_t gs_sp_newnode(gs_sppath *p) {
+     int64_t i = GS_SPHEAD(p)->chain;
+     if (i) {
+         GS_SPHEAD(p)->chain = GS_SPLEAF(p, i)->link;
+@@ -2156,7 +2191,8 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
+     }
+     gs_sp_dropnode(p, p->node[p->h]);
+     for (l = p->h - 1;; l--) {
+-        gs_spinner *in = GS_SPINNER(p, p->node[l]);
++)GSRT"
++R"GSRT(        gs_spinner *in = GS_SPINNER(p, p->node[l]);
+         int64_t e = p->pos[l], m = in->max[e];
+         gs_sp_closein(in, e);
+         if (in->n > 0) {
+@@ -2176,8 +2212,7 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
+ }
+ 
+ /* Takes cnt elements off the front of the span at position k of the path's
+-)GSRT"
+-R"GSRT(   leaf, or the whole span where it holds no more. */
++   leaf, or the whole span where it holds no more. */
+ static void gs_sp_take(gs_sppath *p, int64_t k, int64_t cnt) {
+     gs_spleaf *lf = GS_SPLEAF(p, p->node[p->h]);
+     int64_t c = lf->cnt[k];
+@@ -2380,7 +2415,8 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
+     gs_sppath p, q;
+     gs_spnear s;
+     int64_t end = idx + ol;
+-    if (*n == 0) {
++)GSRT"
++R"GSRT(    if (*n == 0) {
+         gs_spans_free(base, n, top, idx, ol);
+         return gs_spans_alloc(base, n, top, len, cnt);
+     }
+@@ -2399,8 +2435,7 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
+ 
+ /* ---------------------------------------------------------------------------
+    Byte search: std's find_any and find_pair (docs/stdlib.md). A set arrives
+-)GSRT"
+-R"GSRT(   as std's ByteSet, made by its byte_set, which gs_byteset lays out as the
++   as std's ByteSet, made by its byte_set, which gs_byteset lays out as the
+    Goose struct is (spec C.2: packed, in declaration order). `members` is
+    the set. `kind` says how a block of bytes is tested for it: by comparing
+    with 1 to 3 of `bytes` (kinds 1-3), or as the range bytes[0] .. bytes[0] +
+@@ -2561,7 +2596,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
+     }                                                                                  \
+     if (i == np) return -1;                                                            \
+     k = (unsigned)_mm_movemask_epi8(_mm_and_si128(TESTA(GS_LOAD(p + np - 16)),         \
+-                                                  TESTB(GS_LOAD(p + np - 16 + d))))    \
++)GSRT"
++R"GSRT(                                                  TESTB(GS_LOAD(p + np - 16 + d))))    \
+         >> (16 - (np - i));                                                            \
+     return k ? i + gs_ctz32(k) : -1;
+ 
+@@ -2578,8 +2614,7 @@ static GS_INLINE int64_t gs_scan_any_k(const uint8_t *p, int64_t n, const gs_byt
+     GS_ANY_LOOP(GS_TEST_S)
+ }
+ 
+-)GSRT"
+-R"GSRT(static GS_SSSE3 int64_t gs_scan_any_tables(const uint8_t *p, int64_t n, const gs_byteset *s) {
++static GS_SSSE3 int64_t gs_scan_any_tables(const uint8_t *p, int64_t n, const gs_byteset *s) {
+     gs_bsm ms;
+     gs_bsm_init(&ms, s, 1);
+     GS_ANY_LOOP(GS_TABLES_S)
+@@ -2756,7 +2791,8 @@ GS_API int64_t gs_fmt_i64(uint8_t *dst, int64_t v) {
+    same value of its own type and, of those, the ones nearest it, a tie going
+    to the even digit (as Python's repr and Ryu choose). They are found in
+    integers, by Burger and Dybvig's free-format algorithm, not through the C
+-   library: msvcrt, which tcc uses on Windows, rounds a printf tie away from
++)GSRT"
++R"GSRT(   library: msvcrt, which tcc uses on Windows, rounds a printf tie away from
+    zero, and below a power of two the gap to the next float is half the gap
+    above, so the shortest text can lie above the value while the correctly
+    rounded spelling of that length, below it, does not read back.
+@@ -2769,8 +2805,7 @@ typedef struct { int n; uint32_t d[36]; } gs_big;
+ /* a = v << sh, for v > 0. */
+ static void gs_big_set(gs_big *a, uint64_t v, int sh) {
+     int w = sh >> 5, b = sh & 31, i;
+-)GSRT"
+-R"GSRT(    uint64_t lo = v << b, hi = b ? v >> (64 - b) : 0;
++    uint64_t lo = v << b, hi = b ? v >> (64 - b) : 0;
+     for (i = 0; i < w; i++) a->d[i] = 0;
+     a->d[w] = (uint32_t)lo;
+     a->d[w + 1] = (uint32_t)(lo >> 32);
+@@ -2975,7 +3010,8 @@ GS_API int64_t gs_fmt_quoted(uint8_t *dst, const uint8_t *s, int64_t n) {
+     for (int64_t i = 0; i < n; i++) {
+         uint8_t c = s[i];
+         switch (c) {
+-            case '"': *d++ = '\\'; *d++ = '"'; break;
++)GSRT"
++R"GSRT(            case '"': *d++ = '\\'; *d++ = '"'; break;
+             case '\\': *d++ = '\\'; *d++ = '\\'; break;
+             case '\n': *d++ = '\\'; *d++ = 'n'; break;
+             case '\r': *d++ = '\\'; *d++ = 'r'; break;
+@@ -3461,6 +3497,15 @@ static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+     b.hdr->len += n;
+ }
+ 
++/* Appends count elements of size bytes each to the T[>..] a typed builder
++   points at (spec 7.10, Ferrous Goose 0001): the header counts elements. */
++static void gs_bld_push(gs_rref b, const void *p, int64_t count, int64_t size) {
++    if (count <= 0) return;
++    memcpy(b.stk->top, p, (size_t)(count * size));
++    b.stk->top += count * size;
++    b.hdr->len += count;
++}
++
+ /* ffi's cstr and bytes (stdlib/ffi.goose): the bytes at a pointer a C
+    library handed back as a u64, copied into a builder, so nothing foreign
+    is a Goose value without a copy. The pointer is trusted as every extern
+@@ -3620,14 +3665,14 @@ GS_API void gs_os_arg(int64_t i, gs_rref out);
+ GS_API uint8_t gs_os_getenv(sl_u8 name, gs_rref out);
+ GS_API uint8_t gs_os_resource_dir(gs_rref out);
+ GS_API int64_t gs_os_time_ns(void);
+-GS_API int64_t gs_os_clock_ns(void);
++)GSRT"
++R"GSRT(GS_API int64_t gs_os_clock_ns(void);
+ GS_API void gs_os_sleep_ms(int64_t ms);
+ GS_API uint64_t gs_os_random_u64(void);
+ /* os.trim_memory: discards unused complete pages of this thread program's
+    data stacks. Defined with the region registry it walks (runtime_impl.h),
+    but declared here like the other os primitives, so that no prototype is
+-)GSRT"
+-R"GSRT(   emitted for it. For generated code only, whose callers write back their
++   emitted for it. For generated code only, whose callers write back their
+    cached tops first; C called from Goose must not call it. 0 means an OS
+    request failed; a top outside its region panics. */
+ GS_API uint8_t gs_trim_memory(void);
+@@ -4226,6 +4271,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      spelling, (unsigned)GetLastError());
+             gs_panic(msg);
+         }
++        void *hooks = (void *)GetProcAddress(h, "goose_runtime_hooks");
+ #else
+         void *h = dlopen(spelling, RTLD_NOW | RTLD_LOCAL);
+         if (!h) {
+@@ -4234,7 +4280,9 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      why ? why : "unknown error");
+             gs_panic(msg);
+         }
++        void *hooks = dlsym(h, "goose_runtime_hooks");
+ #endif
++        if (hooks) gs_rt_give_hooks((void (*)(const gs_rt_hooks *))hooks);
+         for (int64_t b = 0; b < nbinds; b++) {
+             if (binds[b].lib != l) continue;
+ #ifdef _WIN32
+@@ -4319,15 +4367,15 @@ GS_API int64_t gs_os_time_ns(void) {
+ }
+ 
+ /* A monotonic clock in nanoseconds, for measuring intervals. */
+-GS_API int64_t gs_os_clock_ns(void) {
++)GSRT"
++R"GSRT(GS_API int64_t gs_os_clock_ns(void) {
+ #ifdef _WIN32
+     LARGE_INTEGER f, c;
+     QueryPerformanceFrequency(&f);
+     QueryPerformanceCounter(&c);
+     return (int64_t)((double)c.QuadPart * (1000000000.0 / (double)f.QuadPart));
+ #else
+-)GSRT"
+-R"GSRT(    struct timespec ts;
++    struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+ #endif
+@@ -4431,6 +4479,17 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+     b.hdr->len += n;
+ }
+ 
++/* The runtime's hooks, which a library that exports
++   `void goose_runtime_hooks(const gs_rt_hooks *)` is handed as the program
++   opens it (spec 7.10): abort_msg ends the program as abort(msg) does, or
++   only the worker in a contained one; at_end has a function called as the
++   program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++} gs_rt_hooks;
++
+ /* Appends `count` elements of `size` bytes each to the T[>..] a typed
+    builder points at (spec 7.10): the bytes are the elements as Goose lays
+    them out, packed, and the header counts elements, not bytes. */
+-- 
+2.54.0
+

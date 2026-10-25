@@ -1,0 +1,6 @@
+primes [2, 3, 5, 7, 11, 13, 17, 19]
+above: 2 first id 3
+shapes 4 circles 2
+try [2, 3, 5] true
+try negative false 0: n must not be negative
+doubled [2, 4, 6]

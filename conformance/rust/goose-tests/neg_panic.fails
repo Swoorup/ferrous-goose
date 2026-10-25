@@ -1,0 +1,2 @@
+goose runtime error: panic: negative input -1
+(rust cf::panics)

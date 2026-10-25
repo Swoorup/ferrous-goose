@@ -1,0 +1,21 @@
+[package]
+name = "ferrous-goose"
+description = "The runtime of Ferrous Goose: what the generated Goose <-> Rust shims use"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "goose"
+
+[dependencies]
+ferrous-goose-macros = { path = "../goose-macros", version = "0.1.0" }
+inventory = "0.3"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+libc = "0.2"
+corosensei = "0.2"
+
+[dev-dependencies]
+trybuild = "1"

@@ -1,0 +1,13 @@
+vowels 7
+> HONK AT THE STACK! (20 bytes)
+FRESH!
+ababab
+desserts
+char_count of bad bytes: false, says UTF-8: true
+char_count 5 true
+[centred] 7
+first word hello true
+no word false 0
+middle [3, 4]
+after value true
+after missing false: no "=" in "novalue"
