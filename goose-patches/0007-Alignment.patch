@@ -1,4 +1,4 @@
-From 00250656cec85d5a10b0efe50365a02025f68b37 Mon Sep 17 00:00:00 2001
+From 59c1cdeeb3cfbbc6478ebdb97c5024badb7af056 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:27 +1100
 Subject: [PATCH] Support explicit alignment for structs and enums

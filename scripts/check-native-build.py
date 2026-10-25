@@ -21,7 +21,25 @@ source = cache / "native.c"
 source.write_text("""
 #include "goose.h"
 static int initialized;
-void example_start(const gs_rt_hooks *hooks) { initialized = hooks && hooks->version >= 1; }
+#if defined(__linux__) && defined(__x86_64__)
+/* A PIC object may still have assembly PC-relative references to a global
+   label. The archive must bind that label locally when linked into the JIT. */
+__asm__(
+    ".text\\n"
+    ".globl native_trampoline_return\\n"
+    ".type native_trampoline_return, @function\\n"
+    "native_trampoline_return: ret\\n"
+    ".globl native_trampoline_address\\n"
+    ".type native_trampoline_address, @function\\n"
+    "native_trampoline_address: lea native_trampoline_return(%rip), %rax; ret\\n"
+);
+extern void *native_trampoline_address(void);
+#else
+static void *native_trampoline_address(void) { return &initialized; }
+#endif
+void example_start(const gs_rt_hooks *hooks) {
+    initialized = hooks && hooks->version >= 1 && native_trampoline_address() != 0;
+}
 int64_t example_answer(void) { return initialized ? 42 : -1; }
 void example_squares(int64_t n, gs_rref out) {
     for (int64_t i = 0; i < n; ++i) {

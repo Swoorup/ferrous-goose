@@ -1,4 +1,4 @@
-From 8883952a8acce0c8ccaaa7fdedd7d27d3348df79 Mon Sep 17 00:00:00 2001
+From 308f0e3476cba6f7838c318d69361759f4c62ea1 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:26 +1100
 Subject: [PATCH] Resolve package libraries relative to their package
@@ -10,7 +10,7 @@ Subject: [PATCH] Resolve package libraries relative to their package
  3 files changed, 40 insertions(+), 2 deletions(-)
 
 diff --git a/docs/packages.md b/docs/packages.md
-index e2a1a4e5..33cbe470 100644
+index 30444b4e..0e62ac3b 100644
 --- a/docs/packages.md
 +++ b/docs/packages.md
 @@ -171,7 +171,14 @@ the platform suffixes, maps a name a block uses to the spelling to open

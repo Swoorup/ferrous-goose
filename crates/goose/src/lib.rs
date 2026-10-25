@@ -117,6 +117,8 @@ pub unsafe extern "C" fn goose_metadata(len: *mut usize) -> *const u8 {
 /// another version fails there, by name, rather than misbehave.
 #[no_mangle]
 pub extern "C" fn goose_abi_1() -> u32 {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    shim::register_program_thread();
     abi::ABI_VERSION
 }
 

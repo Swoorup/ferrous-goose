@@ -32,6 +32,13 @@ jobs:
       - name: Visual Studio environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+      - name: Select Microsoft linker (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
+          if (-not (Test-Path $linker)) { throw "MSVC linker not found: $linker" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       - name: Goose, stock and patched
         run: |
           scripts/toolchain.sh --stock

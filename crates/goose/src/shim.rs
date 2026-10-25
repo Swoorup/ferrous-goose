@@ -191,7 +191,27 @@ pub fn abort_at(name: &str, msg: &str) -> ! {
     std::process::exit(1)
 }
 
-/// Whether this is the process's main thread.
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+struct ProgramThread(std::sync::OnceLock<std::thread::ThreadId>);
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+impl ProgramThread {
+    const fn new() -> Self { Self(std::sync::OnceLock::new()) }
+    fn register(&self) { let _ = self.0.set(std::thread::current().id()); }
+    fn is_current(&self) -> bool {
+        self.0.get().is_some_and(|id| *id == std::thread::current().id())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+static PROGRAM_THREAD: ProgramThread = ProgramThread::new();
+
+// Generated modules call the ABI entry during initialization, before workers
+// can query main_thread. A query must never register the querying worker.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn register_program_thread() { PROGRAM_THREAD.register(); }
+
+/// Whether this is the main thread (recorded at module startup on Windows).
 pub fn on_main_thread() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -206,8 +226,27 @@ pub fn on_main_thread() -> bool {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        // The first thread to ask is taken as the main one.
-        static MAIN: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
-        *MAIN.get_or_init(|| std::thread::current().id()) == std::thread::current().id()
+        PROGRAM_THREAD.is_current()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProgramThread;
+    use std::sync::Arc;
+
+    #[test]
+    fn workers_cannot_claim_the_program_thread() {
+        let tracker = Arc::new(ProgramThread::new());
+        let worker = tracker.clone();
+        assert!(!std::thread::spawn(move || worker.is_current()).join().unwrap());
+        tracker.register();
+        assert!(tracker.is_current());
+        let worker = tracker.clone();
+        assert!(!std::thread::spawn(move || {
+            worker.register();
+            worker.is_current()
+        }).join().unwrap());
+        assert!(tracker.is_current());
     }
 }

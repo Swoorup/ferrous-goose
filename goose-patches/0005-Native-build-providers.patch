@@ -1,25 +1,25 @@
-From 7a05d1b830df219bf8f578131722e0d0985bca59 Mon Sep 17 00:00:00 2001
+From f048ab34ee142ade1fd65cb8d76f260807a55f16 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:25 +1100
 Subject: [PATCH] Build native libraries through external providers
 
 ---
- docs/packages.md   |  35 +++++++++++++
+ docs/packages.md   |  37 ++++++++++++++
  src/ast.h          |  10 +++-
  src/capabilities.h |   2 +-
  src/codegen_emit.h |  14 ++++++
  src/main.cpp       |   5 ++
- src/native.h       |  42 ++++++++++++++++
+ src/native.h       |  52 ++++++++++++++++++++
  src/native_build.h | 119 +++++++++++++++++++++++++++++++++++++++++++++
  src/packages.h     |  16 +++++-
- 8 files changed, 239 insertions(+), 4 deletions(-)
+ 8 files changed, 251 insertions(+), 4 deletions(-)
  create mode 100644 src/native_build.h
 
 diff --git a/docs/packages.md b/docs/packages.md
-index ffe04508..e2a1a4e5 100644
+index ffe04508..30444b4e 100644
 --- a/docs/packages.md
 +++ b/docs/packages.md
-@@ -228,6 +228,41 @@ void mylib_name(gs_rref out, int64_t id) {   /* extern fn mylib_name(out: u8[>..
+@@ -228,6 +228,43 @@ void mylib_name(gs_rref out, int64_t id) {   /* extern fn mylib_name(out: u8[>..
  }
  ```
  
@@ -47,7 +47,9 @@ index ffe04508..e2a1a4e5 100644
 +`runtime_hooks` optionally names a public C function taking
 +`const gs_rt_hooks *`, called at program startup. The library is linked into
 +`goose build`; `goose run` builds its JIT library from the same archive.
-+These are build-time operations and add no per-call dispatch.
++These are build-time operations and add no per-call dispatch. On Linux,
++archive symbols stay local to the JIT library; its generated `goose_symbols`
++entry exposes the functions Goose requested.
 +
 +Providers which must combine several packages into one archive may also
 +report `combine` (an argv list) and `combine_input` (an opaque nonempty
@@ -146,7 +148,7 @@ index 0fd1b18b..705e0086 100644
              string s;
              DumpDocs(ast, s);
 diff --git a/src/native.h b/src/native.h
-index 00cdeccf..579aec10 100644
+index 00cdeccf..93e4a353 100644
 --- a/src/native.h
 +++ b/src/native.h
 @@ -18,6 +18,8 @@ inline vector<int> NativePackagesUsed(const Ast &ast, const vector<FnSpec *> &us
@@ -182,7 +184,18 @@ index 00cdeccf..579aec10 100644
      string externtext;
      for (auto &n : externs) Append(externtext, n, "\n");
      // The stamp: what the build was made from, then whether it holds the
-@@ -514,6 +527,35 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -484,6 +497,10 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+     auto made = cat(b.tc.id, "\n", FilesHash(inputs), "\n", Hex8(sidecartext), "\n",
+                     Hex8(externtext), "\n", Hex8(GooseHeader()), "\n");
+     auto aotstamp = cat(made, "aot\n"), jitstamp = cat(made, "jit\n");
++    #ifdef __linux__
++        // Invalidate JIT libraries built before archive symbols were local.
++        if (!p.native_staticlib.empty()) jitstamp += "local-archive-symbols\n";
++    #endif
+     auto stampfile = cat(dir, "/stamp");
+     // Whether the build there serves this one. A CMake package from a path
+     // is handed to CMake every time, whose own build is incremental and
+@@ -514,6 +531,41 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
          if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
          return true;
      }
@@ -207,7 +220,13 @@ index 00cdeccf..579aec10 100644
 +            if (!b.CompileObject(symsrc, symobj, cat("compiling the symbol table of the package ", p.name),
 +                                 cat(dir, "/goose_symbols.cc.log"), symflags))
 +                return false;
-+            if (!b.LinkShared({ symobj, p.native_staticlib }, p.native_libs, out.jitlib, dir,
++            auto jitlibs = p.native_libs;
++            #ifdef __linux__
++                // The table above exports addresses; archive internals stay local.
++                // This also permits PC-relative assembly references to archive labels.
++                if (!msvcstyle) jitlibs.push_back("-Wl,--exclude-libs,ALL");
++            #endif
++            if (!b.LinkShared({ symobj, p.native_staticlib }, jitlibs, out.jitlib, dir,
 +                              cat(dir, "/jit.cc.log"),
 +                              cat("building the package ", p.name, "'s library for the JIT")))
 +                return false;

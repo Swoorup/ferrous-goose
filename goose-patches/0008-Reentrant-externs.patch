@@ -1,4 +1,4 @@
-From 79364b2514cb7931b00fb72ca93802fa4c6b2ef7 Mon Sep 17 00:00:00 2001
+From 71455c9c73224eac6f2f3eb8b77a7f4a840f98ed Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:28 +1100
 Subject: [PATCH] Support callbacks through reentrant native functions
@@ -179,7 +179,7 @@ index 4fa98cd6..d5a3e385 100644
  
  inline string CodeGen::ExportHeader() {
 diff --git a/src/native.h b/src/native.h
-index 579aec10..685b060e 100644
+index 93e4a353..ebdbba34 100644
 --- a/src/native.h
 +++ b/src/native.h
 @@ -89,6 +89,7 @@ inline void ExternNamesIn(const string &path, const string &text, set<string> &n
