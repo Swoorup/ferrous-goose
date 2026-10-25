@@ -271,65 +271,105 @@ pub fn staticlib_path(c: &CrateInfo, o: &BuildOpts) -> PathBuf {
     out_dir(c, o).join(file)
 }
 
-/// The system libraries a Rust staticlib needs on the link line, as rustc
-/// reports them where it can, else the usual ones.
+/// Native link inputs from rustc and Cargo's build-script messages.
 pub fn native_static_libs(c: &CrateInfo, o: &BuildOpts) -> Vec<String> {
     let cache = out_dir(c, o).join(format!("{}-native-static-libs.txt", c.lib_name));
+    let msvc = o.target.as_deref().map(|t| t.contains("msvc")).unwrap_or(cfg!(target_env = "msvc"));
     let mut cmd = Command::new(cargo());
-    cmd.args(["rustc", "--color", "never", "--lib", "--crate-type", "staticlib"])
+    cmd.args(["rustc", "--color", "never", "--message-format=json", "--lib", "--crate-type", "staticlib"])
         .arg("--manifest-path").arg(&c.manifest);
-    if o.release {
-        cmd.arg("--release");
-    }
-    if !o.features.is_empty() {
-        cmd.arg("--features").arg(o.features.join(","));
-    }
-    if let Some(t) = &o.target {
-        cmd.arg("--target").arg(t);
-    }
-    if let Some(d) = &o.target_dir {
-        cmd.arg("--target-dir").arg(d);
-    }
+    if o.release { cmd.arg("--release"); }
+    if !o.features.is_empty() { cmd.arg("--features").arg(o.features.join(",")); }
+    if let Some(t) = &o.target { cmd.arg("--target").arg(t); }
+    if let Some(d) = &o.target_dir { cmd.arg("--target-dir").arg(d); }
     cmd.args(["--", "--print", "native-static-libs"]);
+    let mut paths = Vec::new();
+    let mut libs = None;
     if let Ok(out) = cmd.output() {
-        for l in String::from_utf8_lossy(&out.stderr).lines() {
-            if let Some(i) = l.find("native-static-libs:") {
-                let libs = native_link_flags(&l[i + "native-static-libs:".len()..]);
-                let _ = std::fs::write(&cache, libs.join(" "));
-                return libs;
+        let messages = String::from_utf8_lossy(&out.stdout);
+        paths = native_link_paths(&messages, msvc);
+        for line in messages.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if let Some(message) = v["message"]["message"].as_str() {
+                if let Some(flags) = native_library_note(message) { libs = Some(flags); }
+            }
+        }
+        if libs.is_none() {
+            for line in String::from_utf8_lossy(&out.stderr).lines() {
+                if let Some(flags) = native_library_note(line) { libs = Some(flags); }
             }
         }
     }
-    if let Ok(s) = std::fs::read_to_string(&cache) {
-        // Older versions may have cached a colored diagnostic.
-        let libs = native_link_flags(&s);
-        let _ = std::fs::write(&cache, libs.join(" "));
-        return libs;
+    if libs.is_none() {
+        libs = std::fs::read_to_string(&cache).ok().map(|s| cached_native_flags(&s));
+        if !paths.is_empty() {
+            // Use this build's directories, rather than obsolete cached OUT_DIRs.
+            if let Some(libs) = &mut libs {
+                libs.retain(|s| !s.starts_with("-L") && !s.starts_with("-F") && !s.starts_with("/LIBPATH:"));
+            }
+        }
+    }
+    if let Some(libs) = libs {
+        paths.extend(libs);
+        if let Ok(json) = serde_json::to_string(&paths) { let _ = std::fs::write(&cache, json); }
+        return paths;
     }
     match platform_of(o.target.as_deref()) {
         "macos" => ["-liconv", "-lSystem", "-lc", "-lm"].map(String::from).to_vec(),
         "windows" => ["kernel32.lib", "advapi32.lib", "ntdll.lib", "userenv.lib", "ws2_32.lib", "dbghelp.lib", "bcrypt.lib"]
-            .map(String::from)
-            .to_vec(),
+            .map(String::from).to_vec(),
         _ => ["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"].map(String::from).to_vec(),
     }
 }
 
-/// Strip terminal CSI formatting before flags enter the linker or JSON report.
+fn native_library_note(message: &str) -> Option<Vec<String>> {
+    message.find("native-static-libs:").map(|i| native_link_flags(&message[i + "native-static-libs:".len()..]))
+}
+
+fn native_link_paths(messages: &str, msvc: bool) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in messages.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["reason"] != "build-script-executed" { continue; }
+        let Some(entries) = v["linked_paths"].as_array() else { continue };
+        for entry in entries {
+            let Some(path) = entry.as_str() else { continue };
+            let (kind, path) = path.split_once('=').filter(|(k, _)| matches!(*k, "native" | "framework" | "all" | "crate" | "dependency"))
+                .unwrap_or(("native", path));
+            let flag = match kind {
+                "native" | "all" if msvc => format!("/LIBPATH:{}", path.replace('\\', "/")),
+                "native" | "all" => format!("-L{path}"),
+                "framework" if !msvc => format!("-F{path}"),
+                _ => continue,
+            };
+            if !paths.contains(&flag) { paths.push(flag); }
+        }
+    }
+    paths
+}
+
+fn cached_native_flags(text: &str) -> Vec<String> {
+    match serde_json::from_str::<Vec<String>>(text) {
+        Ok(flags) => flags.iter().map(|s| terminal_plain(s)).collect(),
+        Err(_) => native_link_flags(text),
+    }
+}
+
 fn native_link_flags(text: &str) -> Vec<String> {
+    terminal_plain(text).split_whitespace().map(String::from).collect()
+}
+
+/// Strip terminal CSI formatting before flags enter the linker or JSON report.
+fn terminal_plain(text: &str) -> String {
     let mut plain = String::new();
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next();
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) { break; }
-            }
-        } else {
-            plain.push(c);
-        }
+            for c in chars.by_ref() { if ('@'..='~').contains(&c) { break; } }
+        } else { plain.push(c); }
     }
-    plain.split_whitespace().map(String::from).collect()
+    plain
 }
 
 /// The environment variable the platform's loader searches for a bare
@@ -356,7 +396,7 @@ pub fn loader_path_with(dir: &Path) -> std::ffi::OsString {
 
 #[cfg(test)]
 mod tests {
-    use super::native_link_flags;
+    use super::{native_link_flags, native_link_paths, cached_native_flags, native_library_note};
 
     #[test]
     fn native_flags_ignore_terminal_colors() {
@@ -366,6 +406,24 @@ mod tests {
                    ["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"]);
         assert_eq!(native_link_flags("kernel32.lib bcrypt.lib\u{1b}[0m\r\n"),
                    ["kernel32.lib", "bcrypt.lib"]);
+    }
+
+    #[test]
+    fn cargo_dependency_link_paths_reach_msvc() {
+        let messages = serde_json::json!({"reason":"build-script-executed", "linked_paths":[
+            "native=C:\\Users\\Some User\\.cargo\\windows\\lib", "dependency=target/deps"
+        ]}).to_string();
+        assert_eq!(native_link_paths(&messages, true), ["/LIBPATH:C:/Users/Some User/.cargo/windows/lib"]);
+        let flags = native_library_note("native-static-libs: windows.0.52.0.lib /defaultlib:msvcrt").unwrap();
+        assert_eq!(flags, ["windows.0.52.0.lib", "/defaultlib:msvcrt"]);
+    }
+
+    #[test]
+    fn native_cache_keeps_paths_with_spaces() {
+        let flags = vec!["/LIBPATH:C:/Some User/lib", "windows.0.52.0.lib"];
+        let json = serde_json::to_string(&flags).unwrap();
+        assert_eq!(cached_native_flags(&json), flags);
+        assert_eq!(cached_native_flags("-lc -lm\u{1b}[0m"), ["-lc", "-lm"]);
     }
 
     #[test]

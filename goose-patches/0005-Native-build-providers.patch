@@ -1,4 +1,4 @@
-From f048ab34ee142ade1fd65cb8d76f260807a55f16 Mon Sep 17 00:00:00 2001
+From 44ba87508911ebaba0ae6aafe508df7fe3a9e350 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:25 +1100
 Subject: [PATCH] Build native libraries through external providers
@@ -6,13 +6,14 @@ Subject: [PATCH] Build native libraries through external providers
 ---
  docs/packages.md   |  37 ++++++++++++++
  src/ast.h          |  10 +++-
+ src/build.h        |   3 ++
  src/capabilities.h |   2 +-
  src/codegen_emit.h |  14 ++++++
  src/main.cpp       |   5 ++
- src/native.h       |  52 ++++++++++++++++++++
+ src/native.h       |  77 +++++++++++++++++++++++++++++
  src/native_build.h | 119 +++++++++++++++++++++++++++++++++++++++++++++
  src/packages.h     |  16 +++++-
- 8 files changed, 251 insertions(+), 4 deletions(-)
+ 9 files changed, 279 insertions(+), 4 deletions(-)
  create mode 100644 src/native_build.h
 
 diff --git a/docs/packages.md b/docs/packages.md
@@ -85,6 +86,27 @@ index 403b0eaa..f6739302 100644
  };
  
  struct Ast {
+diff --git a/src/build.h b/src/build.h
+index 8f55b6c3..c03fc0f5 100644
+--- a/src/build.h
++++ b/src/build.h
+@@ -134,6 +134,7 @@ struct Builder {
+             argv.push_back(cat("/Fe:", out));
+             argv.push_back(cat("/Fo:", builddir, "\\"));
+             for (auto &o : objects) argv.push_back(o);
++            argv.push_back("/link");
+             for (auto &l : libs) argv.push_back(l);
+         } else {
+             argv.push_back("-shared");
+@@ -158,6 +159,8 @@ struct Builder {
+             if (opts.debug) argv.push_back(cat("/Fd:", builddir, "\\", PathStem(exe), ".pdb"));
+             argv.push_back(src);
+             for (auto &o : objects) argv.push_back(o);
++            // These files contain linker inputs/options, not cl switches.
++            if (!rsps.empty()) argv.push_back("/link");
+             for (auto &r : rsps) argv.push_back(cat("@", r));
+         } else {
+             argv.push_back(src);
 diff --git a/src/capabilities.h b/src/capabilities.h
 index b4a65e5c..fa473207 100644
 --- a/src/capabilities.h
@@ -148,7 +170,7 @@ index 0fd1b18b..705e0086 100644
              string s;
              DumpDocs(ast, s);
 diff --git a/src/native.h b/src/native.h
-index 00cdeccf..93e4a353 100644
+index 00cdeccf..cc187713 100644
 --- a/src/native.h
 +++ b/src/native.h
 @@ -18,6 +18,8 @@ inline vector<int> NativePackagesUsed(const Ast &ast, const vector<FnSpec *> &us
@@ -160,7 +182,7 @@ index 00cdeccf..93e4a353 100644
          if (ast.packages[pkg].HasNative()) needed.insert(pkg);
      }
      // A package's depth is one more than the deepest it requires; deeper
-@@ -471,12 +473,23 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -471,12 +473,28 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
      // is as the command line named the program, and a build that named it
      // another way is the same build.
      auto inputs = p.csources;
@@ -168,6 +190,11 @@ index 00cdeccf..93e4a353 100644
      inputs.push_back(ForwardSlashes(AbsolutePath(p.sidecar)));
      string sidecartext;
      LoadFile(p.sidecar, sidecartext);
++    if (!p.native_staticlib.empty()) {
++        // Provider flags/search paths can change while its archive stays fresh.
++        sidecartext += "\nnative-link-arguments\n";
++        for (auto &arg : p.native_libs) Append(sidecartext, arg.size(), ":", arg);
++    }
      // The JIT library's symbol table names every extern fn, so a new one
      // rebuilds it.
      auto externs = PackageExternNames(ast, pkg);
@@ -184,7 +211,7 @@ index 00cdeccf..93e4a353 100644
      string externtext;
      for (auto &n : externs) Append(externtext, n, "\n");
      // The stamp: what the build was made from, then whether it holds the
-@@ -484,6 +497,10 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -484,6 +502,10 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
      auto made = cat(b.tc.id, "\n", FilesHash(inputs), "\n", Hex8(sidecartext), "\n",
                      Hex8(externtext), "\n", Hex8(GooseHeader()), "\n");
      auto aotstamp = cat(made, "aot\n"), jitstamp = cat(made, "jit\n");
@@ -195,7 +222,7 @@ index 00cdeccf..93e4a353 100644
      auto stampfile = cat(dir, "/stamp");
      // Whether the build there serves this one. A CMake package from a path
      // is handed to CMake every time, whose own build is incremental and
-@@ -514,6 +531,41 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -514,6 +536,61 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
          if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
          return true;
      }
@@ -204,8 +231,28 @@ index 00cdeccf..93e4a353 100644
 +        // needs, as a link takes them.
 +        auto msvcstyle = b.tc.style == "msvc";
 +        string rsp;
-+        Append(rsp, msvcstyle ? "" : "\"", p.native_staticlib, msvcstyle ? "" : "\"", "\n");
-+        for (auto &l : p.native_libs) Append(rsp, l, "\n");
++        auto addarg = [&](const string &arg) {
++            rsp += '"';
++            if (msvcstyle) {
++                // Windows quotes escape backslash runs only before quotes/end.
++                for (size_t i = 0; i < arg.size();) {
++                    size_t slashes = 0;
++                    while (i < arg.size() && arg[i] == '\\') { slashes++; i++; }
++                    rsp.append(slashes * (i == arg.size() || arg[i] == '"' ? 2 : 1), '\\');
++                    if (i == arg.size()) break;
++                    if (arg[i] == '"') rsp += '\\';
++                    rsp += arg[i++];
++                }
++            } else {
++                for (auto c : arg) {
++                    if (c == '\\' || c == '"') rsp += '\\';
++                    rsp += c;
++                }
++            }
++            rsp += "\"\n";
++        };
++        addarg(p.native_staticlib);
++        for (auto &l : p.native_libs) addarg(l);
 +        if (!b.opts.dryrun && !WriteFileIfChanged(out.rsp, rsp))
 +            throw CompileError { cat("cannot write ", out.rsp) };
 +        if (wantjit) {

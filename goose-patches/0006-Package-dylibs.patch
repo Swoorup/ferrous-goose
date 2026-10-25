@@ -1,4 +1,4 @@
-From 308f0e3476cba6f7838c318d69361759f4c62ea1 Mon Sep 17 00:00:00 2001
+From 540030ebcfb20a146ed9f3ccd3a0967634738038 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:26 +1100
 Subject: [PATCH] Resolve package libraries relative to their package
