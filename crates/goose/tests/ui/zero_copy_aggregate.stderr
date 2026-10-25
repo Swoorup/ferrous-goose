@@ -1,0 +1,11 @@
+error[E0080]: evaluation panicked: zero_copy by-value inputs must be scalars or handles; borrow aggregate values
+ --> tests/ui/zero_copy_aggregate.rs:6:23
+  |
+6 | pub fn by_value(data: Data) -> i64 { data.x }
+  |                       ^^^^ evaluation of `_` failed here
+
+error[E0080]: evaluation panicked: zero_copy by-value results must be scalars or handles; write aggregate values to a builder
+ --> tests/ui/zero_copy_aggregate.rs:9:20
+  |
+9 | pub fn result() -> Data { Data { x: 1 } }
+  |                    ^^^^ evaluation of `_` failed here

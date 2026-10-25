@@ -11,10 +11,13 @@ use crate::meta::{TypeSet, Ty};
 /// does (the generated declaration has explicit pads where rustc put
 /// padding), so a valid, aligned Goose value can be borrowed in place.
 /// `goose_read` must read `GOOSE_SIZE` bytes at most and return `None` for
-/// any bytes that are not a valid value.
+/// any bytes that are not a valid value. `SCALAR` may certify a single
+/// primitive value, never an aggregate payload.
 pub unsafe trait Value: Copy + 'static {
     /// Goose stores it exactly as Rust does.
     const SAME_LAYOUT: bool;
+    /// A scalar value, whose ordinary by-value passing is allowed in strict exports.
+    const SCALAR: bool = false;
     /// Some byte patterns are not values (`bool`, `char`, enum tags), so
     /// Goose bytes are checked before Rust sees them.
     const CHECKED: bool;
@@ -86,6 +89,7 @@ macro_rules! plain_scalar {
     ($($t:ty => $name:literal),* $(,)?) => {$(
         unsafe impl Value for $t {
             const SAME_LAYOUT: bool = true;
+            const SCALAR: bool = true;
             const CHECKED: bool = false;
             const GOOSE_SIZE: usize = core::mem::size_of::<$t>();
             #[inline]
@@ -114,6 +118,7 @@ plain_scalar! { usize => "u64", isize => "i64" }
 
 unsafe impl Value for bool {
     const SAME_LAYOUT: bool = true;
+    const SCALAR: bool = true;
     const CHECKED: bool = true;
     const GOOSE_SIZE: usize = 1;
     #[inline]
@@ -140,6 +145,7 @@ unsafe impl Value for bool {
 /// A `char` is a Goose `u32` that must be a Unicode scalar value.
 unsafe impl Value for char {
     const SAME_LAYOUT: bool = true;
+    const SCALAR: bool = true;
     const CHECKED: bool = true;
     const GOOSE_SIZE: usize = 4;
     #[inline]

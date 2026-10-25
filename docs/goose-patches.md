@@ -99,8 +99,10 @@ Reentrant exports must run on the program thread and may not access a
 mutable `var` global, including through callees. Rust closure-style callbacks
 use a separate coroutine implementation that works with stock Goose.
 
-The current performance guarantees and a proposed strict zero-copy mode are
-explained in [performance.md](performance.md).
+The bridge's strict `#[goose::export(zero_copy)]` contract and current
+performance guarantees are explained in [performance.md](performance.md).
+The annotation uses these existing generic capabilities; it adds no
+project-specific compiler feature.
 
 ## Maintaining the series
 

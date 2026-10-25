@@ -122,8 +122,11 @@ A package anyone can use without Rust:
 cargo goose package dist --targets aarch64-apple-darwin,x86_64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu --zig
 ```
 
-Copying and validation costs, and a proposed strict zero-copy mode, are
-described in [docs/performance.md](docs/performance.md).
+Use `#[goose::export(zero_copy)]` to require borrowing in place: incompatible
+layouts are rejected and misaligned inputs fail instead of being copied.
+Strict exports require compiler interface verification. Ordinary exports
+keep their copy fallback. See [docs/performance.md](docs/performance.md) for
+the supported shapes, examples and validation costs.
 
 ## Testing
 

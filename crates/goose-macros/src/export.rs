@@ -30,17 +30,19 @@ struct Options {
     instantiate: Option<(Ident, Vec<Type>)>,
     throws: bool,
     main_thread: bool,
+    zero_copy: bool,
     name: Option<String>,
     symbol: Option<String>,
 }
 
 fn parse_options(attr: TokenStream) -> syn::Result<Options> {
-    let mut o = Options { instantiate: None, throws: false, main_thread: false, name: None, symbol: None };
+    let mut o = Options { instantiate: None, throws: false, main_thread: false, zero_copy: false, name: None, symbol: None };
     let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(attr)?;
     for m in metas {
         match &m {
             Meta::Path(p) if p.is_ident("throws") => o.throws = true,
             Meta::Path(p) if p.is_ident("main_thread") => o.main_thread = true,
+            Meta::Path(p) if p.is_ident("zero_copy") => o.zero_copy = true,
             Meta::NameValue(nv) if nv.path.is_ident("name") || nv.path.is_ident("symbol") => {
                 let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &nv.value else {
                     return Err(syn::Error::new(nv.value.span(), "expected a string"));
@@ -64,7 +66,7 @@ fn parse_options(attr: TokenStream) -> syn::Result<Options> {
             other => {
                 return Err(syn::Error::new(
                     other.span(),
-                    "goose::export takes instantiate(T = ..), throws, main_thread, name = \"..\", symbol = \"..\"",
+                    "goose::export takes instantiate(T = ..), throws, main_thread, zero_copy, name = \"..\", symbol = \"..\"",
                 ))
             }
         }
@@ -180,7 +182,11 @@ fn id(s: &str) -> Ident {
 
 /// Lowers parameter `i` (not optional, not a callback). `present` wraps the
 /// argument in `Some` for an optional parameter's entry point.
-fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool) {
+fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool, zero_copy: bool) {
+    let hold = id(if zero_copy { "hold_zero_copy" } else { "hold" });
+    let shared = id(if zero_copy { "shared_zero_copy" } else { "shared" });
+    let exclusive = id(if zero_copy { "exclusive_zero_copy" } else { "exclusive" });
+    let take = id(if zero_copy { "take_zero_copy" } else { "take" });
     let raw = format_ident!("p{}", i);
     let h = format_ident!("__h{}", i);
     let name = &p.name;
@@ -200,7 +206,7 @@ fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool) {
             if !owned {
                 l.spans.push(quote!(::goose::slice_span::<u8>(&#raw, false, #name)));
             }
-            l.holds.push(quote! { let #h = unsafe { ::goose::StrRef::hold(#raw, #name) }?; });
+            l.holds.push(quote! { let #h = unsafe { ::goose::StrRef::#hold(#raw, #name) }?; });
             if *owned {
                 quote!(::std::string::String::from(#h.get()))
             } else {
@@ -214,7 +220,7 @@ fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool) {
             if !owned {
                 l.spans.push(quote!(::goose::slice_span::<u8>(&#raw, false, #name)));
             }
-            l.holds.push(quote! { let #h = unsafe { ::goose::SliceRef::<u8>::hold(#raw, #name) }?; });
+            l.holds.push(quote! { let #h = unsafe { ::goose::SliceRef::<u8>::#hold(#raw, #name) }?; });
             if *owned {
                 quote!(#h.into_vec())
             } else {
@@ -232,11 +238,11 @@ fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool) {
                 }
             }
             if *mutable {
-                l.holds.push(quote! { let mut #h = unsafe { ::goose::SliceMut::<#elem>::hold(#raw, #name) }?; });
+                l.holds.push(quote! { let mut #h = unsafe { ::goose::SliceMut::<#elem>::#hold(#raw, #name) }?; });
                 record_base(l, i, quote!(#h.get()));
                 quote!(#h.get_mut())
             } else {
-                l.holds.push(quote! { let #h = unsafe { ::goose::SliceRef::<#elem>::hold(#raw, #name) }?; });
+                l.holds.push(quote! { let #h = unsafe { ::goose::SliceRef::<#elem>::#hold(#raw, #name) }?; });
                 if *owned {
                     quote!(#h.into_vec())
                 } else {
@@ -263,10 +269,10 @@ fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool) {
             l.spans.push(quote!(<#ty as ::goose::Arg>::span(&#raw, #mutable, #name)));
             if *mutable {
                 l.may_alias = true;
-                l.holds.push(quote! { let mut #h = unsafe { <#ty as ::goose::Arg>::exclusive(#raw, #name) }?; });
+                l.holds.push(quote! { let mut #h = unsafe { <#ty as ::goose::Arg>::#exclusive(#raw, #name) }?; });
                 quote!(&mut *#h)
             } else {
-                l.holds.push(quote! { let #h = unsafe { <#ty as ::goose::Arg>::shared(#raw, #name) }?; });
+                l.holds.push(quote! { let #h = unsafe { <#ty as ::goose::Arg>::#shared(#raw, #name) }?; });
                 quote!(&*#h)
             }
         }
@@ -275,7 +281,7 @@ fn lower_param(l: &mut Lowered, i: usize, p: &Param, kind: &PKind, some: bool) {
             l.shapes.push(quote!(<#ty as ::goose::Arg>::C_VAL));
             l.spans.push(quote!(<#ty as ::goose::Arg>::val_span(&#raw, #name)));
             l.may_alias = true;
-            l.takes.push(quote! { let #h = unsafe { <#ty as ::goose::Arg>::take(#raw, #name) }?; });
+            l.takes.push(quote! { let #h = unsafe { <#ty as ::goose::Arg>::#take(#raw, #name) }?; });
             quote!(#h)
         }
         PKind::Reentry => {
@@ -384,12 +390,25 @@ struct RetCtx<'a> {
     stash: Option<String>,
     /// The iterator handle type of a lazy iterator result.
     iter_ty: Option<Ident>,
+    zero_copy: bool,
 }
 
 /// Statements that send `v` (wrapped: inside an Option or Result, where a
 /// scalar goes through an out-pointer).
 fn write_inner(r: &RKind, v: TokenStream, cx: &RetCtx) -> TokenStream {
     match r {
+        RKind::Spans { param, elem } if cx.zero_copy => {
+            let (b, n) = &cx.bases[param];
+            let pname = &cx.params[*param].name;
+            let part = elem.part(quote!(__p));
+            quote! {
+                let mut __b = unsafe { ::goose::GooseVec::<::goose::GooseSpan>::from_raw(__out) };
+                for __p in #v {
+                    let (__o, __n) = ::goose::offset_in_raw(#b, #n, #part, #pname)?;
+                    __b.push(::goose::GooseSpan { at: __o, len: __n });
+                }
+            }
+        }
         RKind::Unit => quote! { let _ = #v; },
         RKind::Scalar(p) => {
             let rv = p.to_raw(quote!(#v));
@@ -666,7 +685,7 @@ fn belem_meta(e: &BElem) -> TokenStream {
     }
 }
 
-fn ret_meta(r: &RKind, iter_name: &str) -> TokenStream {
+fn ret_meta(r: &RKind, iter_name: &str, params: &[Param]) -> TokenStream {
     match r {
         RKind::Unit => quote!(::goose::meta::RetKind::Unit),
         RKind::Scalar(p) => {
@@ -679,23 +698,25 @@ fn ret_meta(r: &RKind, iter_name: &str) -> TokenStream {
             quote!(::goose::meta::RetKind::Vec(<#t as ::goose::Value>::goose_ty()))
         }
         RKind::Borrowed { param, elem } => {
+            let param = params[..*param].iter().filter(|p| !matches!(p.kind, PKind::Reentry)).count();
             let e = belem_meta(elem);
             quote!(::goose::meta::RetKind::Borrowed { param: #param, elem: #e })
         }
         RKind::Spans { param, elem } => {
+            let param = params[..*param].iter().filter(|p| !matches!(p.kind, PKind::Reentry)).count();
             let e = belem_meta(elem);
             quote!(::goose::meta::RetKind::Spans { param: #param, elem: #e })
         }
         RKind::Option(i) => {
-            let i = ret_meta(i, iter_name);
+            let i = ret_meta(i, iter_name, params);
             quote!(::goose::meta::RetKind::Option(::std::boxed::Box::new(#i)))
         }
         RKind::Result(i) => {
-            let i = ret_meta(i, iter_name);
+            let i = ret_meta(i, iter_name, params);
             quote!(::goose::meta::RetKind::Result(::std::boxed::Box::new(#i)))
         }
         RKind::Iter { item, .. } => {
-            let i = ret_meta(item, iter_name);
+            let i = ret_meta(item, iter_name, params);
             quote!(::goose::meta::RetKind::Iter { item: ::std::boxed::Box::new(#i), handle: #iter_name.to_string() })
         }
     }
@@ -712,6 +733,54 @@ fn ret_register(r: &RKind) -> TokenStream {
         RKind::Iter { item, .. } => ret_register(item),
         _ => quote!(),
     }
+}
+
+/// Reject copy-producing syntax, and prove named types through their traits.
+fn zero_copy_checks(params: &[Param], ret: &RKind) -> syn::Result<TokenStream> {
+    fn param(kind: &PKind, ty: &Type, out: &mut TokenStream) -> syn::Result<()> {
+        match kind {
+            PKind::Str { owned: true } | PKind::Bytes { owned: true } | PKind::Slice { owned: true, .. } => {
+                return Err(syn::Error::new(ty.span(), "goose::export(zero_copy): owned inputs require a copy; take a borrowed slice or &str"));
+            }
+            PKind::Callback(_) => {
+                return Err(syn::Error::new(ty.span(), "goose::export(zero_copy): coroutine callbacks copy arguments; use &goose::Reentry for direct callbacks"));
+            }
+            PKind::Slice { elem, .. } | PKind::TypedBuf(elem) => out.extend(quote::quote_spanned! { ty.span()=>
+                const _: () = assert!(<#elem as ::goose::Value>::SAME_LAYOUT,
+                    "zero_copy requires elements with the same layout as Rust");
+            }),
+            PKind::Ref { ty: elem, .. } => out.extend(quote::quote_spanned! { ty.span()=>
+                const _: () = assert!(<#elem as ::goose::Arg>::ZERO_COPY,
+                    "zero_copy requires references with the same layout as Rust");
+            }),
+            PKind::Val(elem) => out.extend(quote::quote_spanned! { ty.span()=>
+                const _: () = assert!(<#elem as ::goose::Arg>::ZERO_COPY_OWNED,
+                    "zero_copy by-value inputs must be scalars or handles; borrow aggregate values");
+            }),
+            PKind::Optional(inner) => param(inner, ty, out)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    fn result(ret: &RKind, out: &mut TokenStream) -> syn::Result<()> {
+        match ret {
+            RKind::Bytes | RKind::Vec(_) | RKind::Copied(_) | RKind::Iter { .. } => {
+                return Err(syn::Error::new(Span::call_site(),
+                    "goose::export(zero_copy): this result requires a payload copy; return a view of an input slice or write to a builder"));
+            }
+            RKind::Out(t) => out.extend(quote::quote_spanned! { t.span()=>
+                const _: () = assert!(<#t as ::goose::Out>::ZERO_COPY,
+                    "zero_copy by-value results must be scalars or handles; write aggregate values to a builder");
+            }),
+            RKind::Option(inner) | RKind::Result(inner) => result(inner, out)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut checks = TokenStream::new();
+    for p in params { param(&p.kind, &p.ty, &mut checks)?; }
+    result(ret, &mut checks)?;
+    Ok(checks)
 }
 
 fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Result<TokenStream> {
@@ -755,6 +824,7 @@ fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Re
     let triples: Vec<(String, Type, PKind)> =
         params.iter().map(|p| (p.name.clone(), p.ty.clone(), p.kind.clone())).collect();
     let ret = classify_ret(&sig.output, &triples)?;
+    let checks = if opts.zero_copy { zero_copy_checks(&params, &ret)? } else { TokenStream::new() };
 
     let callbacks: Vec<usize> =
         params.iter().enumerate().filter(|(_, p)| matches!(p.kind, PKind::Callback(_))).map(|(i, _)| i).collect();
@@ -785,7 +855,7 @@ fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Re
         None => quote!(),
     };
     let doc = doc_of(&f.attrs);
-    let mut out = TokenStream::new();
+    let mut out = checks;
     let iter_name = format!("{}Iter", camel(&goose_name));
     let iter_ty = format_ident!("__GooseIter_{}", base);
 
@@ -811,27 +881,27 @@ fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Re
                 if let PKind::Optional(inner) = &p.kind {
                     let k = optionals.iter().position(|&o| o == i).unwrap();
                     if mask & (1 << k) != 0 {
-                        lower_param(&mut l, i, p, inner, true);
+                        lower_param(&mut l, i, p, inner, true, opts.zero_copy);
                     } else {
                         l.args.push(quote!(::core::option::Option::None));
                     }
                 } else {
-                    lower_param(&mut l, i, p, &p.kind, false);
+                    lower_param(&mut l, i, p, &p.kind, false, opts.zero_copy);
                 }
             }
             let args = &l.args;
             let call = quote!(#fname #turbofish (#(#args),*));
-            let cx = RetCtx { bases: &l.bases, params: &params, stash: None, iter_ty: Some(iter_ty.clone()) };
+            let cx = RetCtx { bases: &l.bases, params: &params, stash: None, iter_ty: Some(iter_ty.clone()), zero_copy: opts.zero_copy };
             out.extend(shim(&sym, &qualified, opts.main_thread, &l, &call, &ret, &cx));
-            if ret.needs_typed() {
+            if ret.needs_typed() && !opts.zero_copy {
                 // Counted, then copied: for a compiler without typed builders.
                 let len_sym = format!("{sym}__len");
                 let key = format!("{base}__stash");
-                let cx = RetCtx { bases: &l.bases, params: &params, stash: Some(key), iter_ty: None };
+                let cx = RetCtx { bases: &l.bases, params: &params, stash: Some(key), iter_ty: None, zero_copy: false };
                 out.extend(shim(&len_sym, &qualified, opts.main_thread, &l, &call, &ret, &cx));
             }
         }
-        if ret.needs_typed() {
+        if ret.needs_typed() && !opts.zero_copy {
             let take = format_ident!("{}__take", base);
             let key = format!("{base}__stash");
             let elem = typed_elem(&ret).unwrap();
@@ -858,13 +928,14 @@ fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Re
         quote!(::goose::meta::ParamDef { name: #n.to_string(), kind: #k })
     });
     let regs: Vec<TokenStream> = params.iter().map(|p| param_register(&p.kind)).collect();
-    let rmeta = ret_meta(&ret, &iter_name);
+    let rmeta = ret_meta(&ret, &iter_name, &params);
     let rreg = ret_register(&ret);
     // The base shim's C signature, as lowered here, for cargo goose to check.
+    let zero_copy = opts.zero_copy;
     let mut l0 = Lowered::default();
     if optionals.is_empty() && callbacks.is_empty() {
         for (i, p) in params.iter().enumerate() {
-            lower_param(&mut l0, i, p, &p.kind, false);
+            lower_param(&mut l0, i, p, &p.kind, false, opts.zero_copy);
         }
         let rl = ret_lower(&ret, false);
         let shapes_extra = rl.shapes;
@@ -885,6 +956,7 @@ fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Re
                     throws: #throws,
                     main_thread: #mt,
                     reentrant: #reentrant,
+                    zero_copy: #zero_copy,
                     c_params: ::std::vec![#(::std::string::String::from(#shapes),)* #(::std::string::String::from(#shapes_extra)),*],
                     c_ret: #c_ret_shape.to_string(),
                 });
@@ -909,6 +981,7 @@ fn function(f: &ItemFn, inst: Option<&(Ident, Type)>, opts: &Options) -> syn::Re
                     throws: #throws,
                     main_thread: #mt,
                     reentrant: #reentrant,
+                    zero_copy: #zero_copy,
                     c_params: ::std::vec::Vec::new(),
                     c_ret: ::std::string::String::new(),
                 });
@@ -939,7 +1012,7 @@ fn iter_shims(
     let mut s = Vec::new();
     ret_out_params(item, true, false, &mut c, &mut s);
     let empty = HashMap::new();
-    let cx = RetCtx { bases: &empty, params: &[], stash: None, iter_ty: None };
+    let cx = RetCtx { bases: &empty, params: &[], stash: None, iter_ty: None, zero_copy: false };
     let w = write_inner(item, quote!(__x), &cx);
     let meta_fn = format_ident!("__goose_meta_iter_{}", base);
     let doc = format!("The items of {qualified}, one per next.\n{doc}");
@@ -1054,7 +1127,7 @@ fn callback_shims(
             }
             _ => {}
         }
-        lower_param(&mut l, i, p, &p.kind, false);
+        lower_param(&mut l, i, p, &p.kind, false, false);
         let a = l.args.pop().unwrap();
         match &p.kind {
             PKind::Str { owned: false } => {
@@ -1179,7 +1252,7 @@ fn callback_shims(
     let rp = &rl.c_params;
     let c_ret = &rl.c_ret;
     let empty = HashMap::new();
-    let cx = RetCtx { bases: &empty, params, stash: None, iter_ty: None };
+    let cx = RetCtx { bases: &empty, params, stash: None, iter_ty: None, zero_copy: false };
     let write = write_top(ret, quote!(__r), &cx);
     let fail = fail_closure(ret, false);
     let fallible = ret.fallible();

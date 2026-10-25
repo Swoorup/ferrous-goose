@@ -1,0 +1,10 @@
+sum 6
+scaled [2, 4, 6] = 12
+hit 8 8
+view view
+word one
+word two
+word three
+squares [0, 1, 4, 9]
+rect 1.0 1.0
+copies 0

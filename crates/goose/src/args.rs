@@ -99,6 +99,13 @@ unsafe fn lendable<T: Value>(p: *const u8, n: usize) -> Result<bool, BridgeError
     Ok(true)
 }
 
+fn zero_copy_error<T: Value>(param: &'static str) -> BridgeError {
+    BridgeError::Fail(format!(
+        "zero_copy argument {param} requires the same layout and alignment {} as Rust; copying is disabled",
+        core::mem::align_of::<T>()
+    ))
+}
+
 fn invalid<T: Value>() -> BridgeError {
     BridgeError::Fail(format!("an argument holds a value that is not a valid {}", crate::ty_name(&T::goose_ty())))
 }
@@ -137,12 +144,31 @@ impl<T: Value> SliceRef<T> {
     /// # Safety
     /// `raw` must be a slice Goose passed to this call.
     pub unsafe fn hold(raw: GooseSlice<T>, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<true>(raw, param)
+    }
+
+    /// Borrow in place, failing instead of copying when layout or alignment differs.
+    ///
+    /// # Safety
+    /// The pointer/slice must meet the same requirements as `hold`.
+    pub unsafe fn hold_zero_copy(raw: GooseSlice<T>, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<false>(raw, param)
+    }
+
+    #[inline]
+    unsafe fn hold_impl<const COPY: bool>(raw: GooseSlice<T>, param: &'static str) -> Result<Self, BridgeError> {
+        if !COPY && !T::SAME_LAYOUT {
+            return Err(zero_copy_error::<T>(param));
+        }
         let (p, n) = slice_parts(raw, param)?;
         if n == 0 {
             return Ok(SliceRef { ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0, owned: None });
         }
         if lendable::<T>(p, n)? {
             return Ok(SliceRef { ptr: p as *const T, len: n, owned: None });
+        }
+        if !COPY {
+            return Err(zero_copy_error::<T>(param));
         }
         let v = copy_in::<T>(p, n)?;
         Ok(SliceRef { ptr: v.as_ptr(), len: n, owned: Some(v) })
@@ -179,12 +205,31 @@ impl<T: Value> SliceMut<T> {
     /// # Safety
     /// `raw` must be a mutable slice Goose passed to this call.
     pub unsafe fn hold(raw: GooseSlice<T>, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<true>(raw, param)
+    }
+
+    /// Borrow in place, failing instead of copying when layout or alignment differs.
+    ///
+    /// # Safety
+    /// The pointer/slice must meet the same requirements as `hold`.
+    pub unsafe fn hold_zero_copy(raw: GooseSlice<T>, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<false>(raw, param)
+    }
+
+    #[inline]
+    unsafe fn hold_impl<const COPY: bool>(raw: GooseSlice<T>, param: &'static str) -> Result<Self, BridgeError> {
+        if !COPY && !T::SAME_LAYOUT {
+            return Err(zero_copy_error::<T>(param));
+        }
         let (p, n) = slice_parts(raw, param)?;
         if n == 0 {
             return Ok(SliceMut { goose: p, ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0, owned: None });
         }
         if lendable::<T>(p, n)? {
             return Ok(SliceMut { goose: p, ptr: p as *mut T, len: n, owned: None });
+        }
+        if !COPY {
+            return Err(zero_copy_error::<T>(param));
         }
         let mut v = copy_in::<T>(p, n)?;
         Ok(SliceMut { goose: p, ptr: v.as_mut_ptr(), len: n, owned: Some(v) })
@@ -222,7 +267,18 @@ impl StrRef {
     /// # Safety
     /// `raw` must be a slice Goose passed to this call.
     pub unsafe fn hold(raw: GooseSlice<u8>, param: &'static str) -> Result<Self, BridgeError> {
-        let bytes = SliceRef::hold(raw, param)?;
+        Self::checked(SliceRef::hold(raw, param)?, param)
+    }
+
+    /// Borrow UTF-8 text in place without a copy fallback.
+    ///
+    /// # Safety
+    /// `raw` must be a slice Goose passed to this call.
+    pub unsafe fn hold_zero_copy(raw: GooseSlice<u8>, param: &'static str) -> Result<Self, BridgeError> {
+        Self::checked(SliceRef::hold_zero_copy(raw, param)?, param)
+    }
+
+    fn checked(bytes: SliceRef<u8>, param: &'static str) -> Result<Self, BridgeError> {
         if let Err(e) = core::str::from_utf8(bytes.get()) {
             return Err(BridgeError::Fail(format!("argument {param} is not valid UTF-8: {e}")));
         }
@@ -254,11 +310,30 @@ impl<T: Value> ValRef<T> {
     /// # Safety
     /// `p` must be a reference Goose passed to this call.
     pub unsafe fn hold(p: *const u8, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<true>(p, param)
+    }
+
+    /// Borrow in place, failing instead of copying when layout or alignment differs.
+    ///
+    /// # Safety
+    /// The pointer/slice must meet the same requirements as `hold`.
+    pub unsafe fn hold_zero_copy(p: *const u8, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<false>(p, param)
+    }
+
+    #[inline]
+    unsafe fn hold_impl<const COPY: bool>(p: *const u8, param: &'static str) -> Result<Self, BridgeError> {
+        if !COPY && !T::SAME_LAYOUT {
+            return Err(zero_copy_error::<T>(param));
+        }
         if p.is_null() {
             return Err(BridgeError::Abort(format!("argument {param} is a null reference")));
         }
         if lendable::<T>(p, 1)? {
             return Ok(ValRef { place: Place::InPlace(p as *mut T) });
+        }
+        if !COPY {
+            return Err(zero_copy_error::<T>(param));
         }
         count_copy();
         Ok(ValRef { place: Place::Owned(T::goose_read(p).ok_or_else(invalid::<T>)?) })
@@ -285,11 +360,30 @@ impl<T: Value> ValMut<T> {
     /// # Safety
     /// `p` must be a mutable reference Goose passed to this call.
     pub unsafe fn hold(p: *mut u8, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<true>(p, param)
+    }
+
+    /// Borrow in place, failing instead of copying when layout or alignment differs.
+    ///
+    /// # Safety
+    /// The pointer/slice must meet the same requirements as `hold`.
+    pub unsafe fn hold_zero_copy(p: *mut u8, param: &'static str) -> Result<Self, BridgeError> {
+        Self::hold_impl::<false>(p, param)
+    }
+
+    #[inline]
+    unsafe fn hold_impl<const COPY: bool>(p: *mut u8, param: &'static str) -> Result<Self, BridgeError> {
+        if !COPY && !T::SAME_LAYOUT {
+            return Err(zero_copy_error::<T>(param));
+        }
         if p.is_null() {
             return Err(BridgeError::Abort(format!("argument {param} is a null reference")));
         }
         if lendable::<T>(p, 1)? {
             return Ok(ValMut { goose: p, place: Place::InPlace(p as *mut T) });
+        }
+        if !COPY {
+            return Err(zero_copy_error::<T>(param));
         }
         count_copy();
         Ok(ValMut { goose: p, place: Place::Owned(T::goose_read(p).ok_or_else(invalid::<T>)?) })
@@ -333,6 +427,8 @@ impl<T: Value> Drop for ValMut<T> {
 /// # Safety
 /// `Raw` and `ValRaw` must be the C shapes the generated Goose passes for
 /// `&T`/`&mut T` and `T`, and the holders must lend only call-scoped access.
+/// The zero-copy constants certify that the corresponding strict methods
+/// never duplicate a bulk payload, including on a misaligned address.
 pub unsafe trait Arg: Sized + 'static {
     type Raw: Copy;
     type ValRaw: Copy;
@@ -345,6 +441,26 @@ pub unsafe trait Arg: Sized + 'static {
     /// The C shape of `&T` and of `T`, for the record.
     const C_REF: &'static str;
     const C_VAL: &'static str;
+    /// Strict references borrow the original storage without payload copies.
+    const ZERO_COPY: bool = false;
+    /// By-value scalars and owned handles can cross without a bulk payload copy.
+    const ZERO_COPY_OWNED: bool = false;
+
+    /// # Safety
+    /// As for `shared`; implementations must never allocate a fallback copy.
+    unsafe fn shared_zero_copy(_raw: Self::Raw, param: &'static str) -> Result<Self::Shared, BridgeError> {
+        Err(BridgeError::Fail(format!("zero_copy argument {param} does not support borrowing in place")))
+    }
+    /// # Safety
+    /// As for `exclusive`; implementations must never allocate a fallback copy.
+    unsafe fn exclusive_zero_copy(_raw: Self::Raw, param: &'static str) -> Result<Self::Exclusive, BridgeError> {
+        Err(BridgeError::Fail(format!("zero_copy argument {param} does not support borrowing in place")))
+    }
+    /// # Safety
+    /// As for `take`; implementations must never duplicate the bulk payload.
+    unsafe fn take_zero_copy(_raw: Self::ValRaw, param: &'static str) -> Result<Self, BridgeError> {
+        Err(BridgeError::Fail(format!("zero_copy argument {param} cannot be taken without copying")))
+    }
 
     fn keep(s: Self::Shared) -> Self::Kept;
 
@@ -367,10 +483,13 @@ pub unsafe trait Arg: Sized + 'static {
 /// A type that may be a result through an out-pointer: values and handles.
 ///
 /// # Safety
-/// `OutRaw` must be the out-pointer the generated Goose passes.
+/// `OutRaw` must be the out-pointer the generated Goose passes. A true
+/// `ZERO_COPY` certifies that `put` does not duplicate a bulk payload.
 pub unsafe trait Out: Sized + 'static {
     type OutRaw: Copy;
     const C_OUT: &'static str;
+    /// `put` writes a scalar or publishes a handle, without duplicating a bulk payload.
+    const ZERO_COPY: bool = false;
     /// # Safety
     /// `out` must be the out-pointer Goose passed to this call.
     unsafe fn put(self, out: Self::OutRaw) -> Result<(), BridgeError>;
@@ -392,6 +511,20 @@ macro_rules! __value_arg {
             type Kept = $crate::Kept<$t>;
             const C_REF: &'static str = "ptr";
             const C_VAL: &'static str = "ptr";
+            const ZERO_COPY: bool = <$t as $crate::Value>::SAME_LAYOUT;
+            const ZERO_COPY_OWNED: bool = <$t as $crate::Value>::SCALAR;
+            unsafe fn shared_zero_copy(raw: *mut u8, param: &'static str) -> Result<Self::Shared, $crate::BridgeError> {
+                $crate::ValRef::hold_zero_copy(raw, param)
+            }
+            unsafe fn exclusive_zero_copy(raw: *mut u8, param: &'static str) -> Result<Self::Exclusive, $crate::BridgeError> {
+                $crate::ValMut::hold_zero_copy(raw, param)
+            }
+            unsafe fn take_zero_copy(raw: *const u8, param: &'static str) -> Result<Self, $crate::BridgeError> {
+                if !Self::ZERO_COPY_OWNED {
+                    return Err($crate::BridgeError::Fail(::std::format!("zero_copy argument {param} must be borrowed")));
+                }
+                Ok(*$crate::ValRef::<$t>::hold_zero_copy(raw, param)?)
+            }
             fn keep(s: $crate::ValRef<$t>) -> $crate::Kept<$t> {
                 $crate::Kept(*s)
             }
@@ -425,6 +558,7 @@ macro_rules! __value_arg {
         unsafe impl $crate::Out for $t {
             type OutRaw = *mut u8;
             const C_OUT: &'static str = "out:ptr";
+            const ZERO_COPY: bool = <$t as $crate::Value>::SCALAR;
             unsafe fn put(self, out: *mut u8) -> Result<(), $crate::BridgeError> {
                 $crate::Value::goose_write(&self, out);
                 Ok(())
@@ -464,6 +598,13 @@ unsafe impl<T: Value, const N: usize> Arg for [T; N] {
     type Kept = Kept<[T; N]>;
     const C_REF: &'static str = "ptr";
     const C_VAL: &'static str = "ptr";
+    const ZERO_COPY: bool = <Self as Value>::SAME_LAYOUT;
+    unsafe fn shared_zero_copy(raw: *mut u8, param: &'static str) -> Result<Self::Shared, BridgeError> {
+        ValRef::hold_zero_copy(raw, param)
+    }
+    unsafe fn exclusive_zero_copy(raw: *mut u8, param: &'static str) -> Result<Self::Exclusive, BridgeError> {
+        ValMut::hold_zero_copy(raw, param)
+    }
     fn keep(s: ValRef<[T; N]>) -> Kept<[T; N]> {
         Kept(*s)
     }

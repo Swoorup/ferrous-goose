@@ -35,6 +35,8 @@ pub struct Options {
     /// The compiler has `reentrant` externs (goose-patches/0008), which a
     /// function calling Goose back is declared as.
     pub reentrant: bool,
+    /// Compiler layout JSON is available; required before exposing strict exports.
+    pub emit_interface: bool,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -373,6 +375,17 @@ impl Generator<'_> {
             }
         }
         for f in &lib.functions {
+            if f.zero_copy {
+                crate::zero_copy::validate(f, lib)?;
+                if !self.o.emit_interface {
+                    let _ = writeln!(self.wrappers, "// {}: zero_copy needs compiler layout verification (--emit-interface).\n", f.name);
+                    continue;
+                }
+                if !self.o.typed_builders && (needs_typed(&f.ret) || f.params.iter().any(|p| crate::zero_copy::typed_builder(&p.kind))) {
+                    let _ = writeln!(self.wrappers, "// {}: zero_copy needs typed builders; the count/copy fallback is disabled.\n", f.name);
+                    continue;
+                }
+            }
             if f.reentrant && !self.o.reentrant {
                 let _ = writeln!(
                     self.wrappers,
@@ -388,6 +401,9 @@ impl Generator<'_> {
                     f.name
                 );
                 continue;
+            }
+            if f.zero_copy {
+                let _ = writeln!(self.wrappers, "// zero_copy: {}", f.symbol);
             }
             self.reentrant_now = f.reentrant;
             let r = self.function(f).map_err(|e| format!("{}::{}: {e}", lib.namespace, f.name));

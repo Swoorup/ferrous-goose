@@ -86,6 +86,17 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             type Kept = ::goose::HandleRef<#ident>;
             const C_REF: &'static str = "handle";
             const C_VAL: &'static str = "handle";
+            const ZERO_COPY: bool = true;
+            const ZERO_COPY_OWNED: bool = true;
+            unsafe fn shared_zero_copy(raw: ::goose::Handle, param: &'static str) -> ::core::result::Result<Self::Shared, ::goose::BridgeError> {
+                <Self as ::goose::Arg>::shared(raw, param)
+            }
+            unsafe fn exclusive_zero_copy(raw: ::goose::Handle, param: &'static str) -> ::core::result::Result<Self::Exclusive, ::goose::BridgeError> {
+                <Self as ::goose::Arg>::exclusive(raw, param)
+            }
+            unsafe fn take_zero_copy(raw: ::goose::Handle, param: &'static str) -> ::core::result::Result<Self, ::goose::BridgeError> {
+                <Self as ::goose::Arg>::take(raw, param)
+            }
             fn keep(s: ::goose::HandleRef<#ident>) -> ::goose::HandleRef<#ident> {
                 s
             }
@@ -120,6 +131,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         unsafe impl ::goose::Out for #ident {
             type OutRaw = *mut ::goose::Handle;
             const C_OUT: &'static str = "out:handle";
+            const ZERO_COPY: bool = true;
             unsafe fn put(self, out: *mut ::goose::Handle) -> ::core::result::Result<(), ::goose::BridgeError> {
                 let h = <#ident as ::goose::HandleType>::table().insert(self);
                 ::core::ptr::write_unaligned(out, h);

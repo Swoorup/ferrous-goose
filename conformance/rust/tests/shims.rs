@@ -141,7 +141,7 @@ fn handles_through_the_shims() {
 #[test]
 fn the_records() {
     let json = goose::metadata_json();
-    assert!(json.starts_with("{\"format\":1,\"abi\":1"), "{}", &json[..60]);
+    assert!(json.starts_with("{\"format\":2,\"abi\":1"), "{}", &json[..60]);
     assert!(json.contains("\"namespace\":\"cf\""));
     assert!(json.contains("\"symbol\":\"cf_trim\""));
     assert!(json.contains("\"name\":\"Hit\",\"doc\""));

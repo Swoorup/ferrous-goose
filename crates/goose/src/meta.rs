@@ -156,6 +156,8 @@ pub struct FnDef {
     pub main_thread: bool,
     /// Takes `&goose::Reentry`: the Goose declaration is `reentrant`.
     pub reentrant: bool,
+    /// No bridge payload copies on the successful data path.
+    pub zero_copy: bool,
     /// The C parameters the shim takes, as the macro lowered them, for
     /// `cargo goose` to check its own lowering against.
     pub c_params: Vec<String>,
@@ -487,8 +489,8 @@ pub fn to_json(lib: &Library, crate_name: &str, crate_version: &str, namespace: 
         ret_json(&mut o, &f.ret);
         let _ = write!(
             o,
-            ",\"throws\":{},\"main_thread\":{},\"reentrant\":{},\"c_params\":[",
-            f.throws, f.main_thread, f.reentrant
+            ",\"throws\":{},\"main_thread\":{},\"reentrant\":{},\"zero_copy\":{},\"c_params\":[",
+            f.throws, f.main_thread, f.reentrant, f.zero_copy
         );
         for (j, c) in f.c_params.iter().enumerate() {
             if j > 0 {

@@ -1,0 +1,5 @@
+error: goose::export(zero_copy): coroutine callbacks copy arguments; use &goose::Reentry for direct callbacks
+ --> tests/ui/zero_copy_callback.rs:2:36
+  |
+2 | pub fn callback(xs: &[i64], mut f: impl FnMut(i64) -> i64) -> i64 {
+  |                                    ^^^^

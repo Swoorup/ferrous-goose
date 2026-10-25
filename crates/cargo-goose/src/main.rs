@@ -32,7 +32,7 @@ options:
   --goose PATH        the Goose compiler (default: $GOOSE, .toolchain/, PATH)
   --allow-runtime H   accept a Goose runtime the bridge was not checked against
   --no-verify         skip comparing the module's layouts with the compiler's
-                      (done where goose has --emit-interface)
+                      (done where goose has --emit-interface; mandatory for zero_copy)
 ";
 
 #[derive(Default)]
@@ -153,7 +153,8 @@ fn gen_options(a: &Args, link: gen::Link) -> Result<(PathBuf, toolchain::GooseIn
     let typed = a.typed.unwrap_or_else(|| info.has("typed-builders"));
     let align = info.has("align");
     let reentrant = info.has("reentrant");
-    Ok((goose, info, gen::Options { link, typed_builders: typed, align, reentrant }))
+    let emit_interface = info.has("emit-interface");
+    Ok((goose, info, gen::Options { link, typed_builders: typed, align, reentrant, emit_interface }))
 }
 
 fn check_versions(a: &Args, info: &toolchain::GooseInfo, b: &cargo_goose::Bindings) -> Result<(), String> {
@@ -161,7 +162,7 @@ fn check_versions(a: &Args, info: &toolchain::GooseInfo, b: &cargo_goose::Bindin
     let desc = format!("{} {} (Ferrous Goose {})", lib.crate_name, lib.version, lib.bridge);
     let allow = a.allow_runtime.as_deref() == Some(info.runtime.as_str());
     toolchain::check_runtime(info, &lib.goose_runtime, &desc, allow)?;
-    if info.has("emit-interface") && !a.no_verify {
+    if info.has("emit-interface") && (!a.no_verify || lib.functions.iter().any(|f| f.zero_copy)) {
         let goose = toolchain::find_goose(a.goose.as_deref())?;
         cargo_goose::verify::verify(&goose, lib, &b.module)?;
     }
@@ -465,4 +466,49 @@ fn cmd_combine(a: &Args) -> Result<u8, String> {
     let j = serde_json::json!({ "version": 1, "staticlib": staticlib, "native_libs": libs, "runtime_hooks": "goose_runtime_hooks" });
     println!("goose-native: {j}");
     Ok(0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn no_verify_cannot_bypass_a_strict_export() {
+        let dir = std::env::temp_dir().join(format!("goose-strict-verification-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compiler = dir.join("compiler");
+        std::fs::write(&compiler, "#!/bin/sh\necho 'verification was requested' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let library = cargo_goose::meta::parse(&serde_json::json!({
+            "format": 2, "abi": 1, "bridge": "test", "goose_runtime": "test",
+            "crate": "test", "version": "0", "namespace": "strict",
+            "structs": [{"name":"Data", "doc":"", "size":8, "align":8,
+                "goose_size":8, "same_layout":true, "fields":[]}],
+            "enums": [], "handles": [], "errors": [],
+            "functions": [{"name":"f", "symbol":"strict_f", "doc":"", "zero_copy":true,
+                "params":[{"name":"x", "kind":{"ref":{"named":"Data"}}}], "ret":"unit",
+                "throws":false, "main_thread":false, "c_params":["ptr"], "c_ret":"void"}]
+        }).to_string(), "test").unwrap();
+        let mut b = cargo_goose::Bindings {
+            library,
+            module: "\nstruct Data { x: i64 }\n// zero_copy: strict_f\n".into(),
+            cdylib: PathBuf::new(),
+            crate_info: toolchain::CrateInfo {
+                name: "test".into(), version: "0".into(), lib_name: "test".into(),
+                manifest: PathBuf::new(), dir: PathBuf::new(), target_dir: PathBuf::new(),
+                crate_types: vec![], namespace: None,
+            },
+        };
+        let args = Args { no_verify: true, goose: Some(compiler.to_string_lossy().into()), ..Default::default() };
+        let info = toolchain::GooseInfo { runtime: "test".into(), native_abi: Some(1), features: vec!["emit-interface".into()] };
+        let err = check_versions(&args, &info, &b).unwrap_err();
+        assert!(err.contains("verification was requested"), "{err}");
+        b.library.structs.clear();
+        b.library.functions[0].params[0].kind = cargo_goose::meta::ParamKind::Slice(cargo_goose::meta::Ty::Prim("i64".into()));
+        b.module = "// zero_copy: strict_f\n".into();
+        let err = check_versions(&args, &info, &b).unwrap_err();
+        assert!(err.contains("verification was requested"), "even a primitive-only strict API must be checked: {err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

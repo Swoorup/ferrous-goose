@@ -34,7 +34,7 @@ fn library() -> meta::Library {
 }
 
 fn module(typed: bool, align: bool) -> String {
-    let o = Options { link: Link::Dynamic("goose_conformance".into()), typed_builders: typed, align, reentrant: align };
+    let o = Options { link: Link::Dynamic("goose_conformance".into()), typed_builders: typed, align, reentrant: align, emit_interface: align };
     generate(&library(), &o).expect("a module")
 }
 
@@ -92,7 +92,7 @@ fn typed_builders_or_counted_copies() {
 
 #[test]
 fn static_linking_uses_plain_externs() {
-    let o = Options { link: Link::Static, typed_builders: true, align: true, reentrant: true };
+    let o = Options { link: Link::Static, typed_builders: true, align: true, reentrant: true, emit_interface: true };
     let m = generate(&library(), &o).unwrap();
     assert!(m.contains("extern fn goose_abi_1() -> u32;"));
     assert!(!m.contains("extern \"goose_conformance\""));
@@ -138,4 +138,65 @@ fn calling_back_is_reentrant() {
     assert!(patched.contains("reentrant fn cf_walk(depth: i64, out: i64&, err: u8[>..]&) -> bool;"), "{patched}");
     let stock = module(false, false);
     assert!(stock.contains("// walk: calls the program back"));
+}
+
+#[test]
+fn strict_bindings_require_verification_and_never_use_copy_fallbacks() {
+    let lib = library();
+    let strict = lib.functions.iter().find(|f| f.name == "zc_sum").unwrap();
+    assert!(strict.zero_copy);
+    let stock = module(false, false);
+    assert!(stock.contains("zc_sum: zero_copy needs compiler layout verification"));
+    assert!(!stock.contains("fn cf_zc_sum("));
+    let patched = module(true, true);
+    assert!(patched.contains("// zero_copy: cf_zc_sum\n"));
+    assert!(!patched.contains("cf_zc_words__len"));
+    assert!(!patched.contains("cf_zc_words__take"));
+    let opts = Options { link: Link::Static, typed_builders: false, align: true, reentrant: true, emit_interface: true };
+    let no_builders = generate(&lib, &opts).unwrap();
+    assert!(no_builders.contains("zc_words: zero_copy needs typed builders"));
+    assert!(!no_builders.contains("fn cf_zc_words("));
+    // Other exports still have their ordinary stock-compiler fallback.
+    assert!(no_builders.contains("cf_primes__len"));
+}
+
+#[test]
+fn strict_metadata_cannot_claim_a_converted_type() {
+    let mut lib = library();
+    lib.structs.iter_mut().find(|s| s.name == "Hit").unwrap().same_layout = false;
+    let opts = Options { link: Link::Static, typed_builders: true, align: true, reentrant: true, emit_interface: true };
+    let err = generate(&lib, &opts).unwrap_err();
+    assert!(err.contains("zero_copy requires Hit to have the same layout"), "{err}");
+}
+
+#[test]
+fn strict_enum_layouts_are_checked_beyond_total_size() {
+    let Some(goose) = patched_goose() else { return };
+    let lib = library();
+    let m = module(true, true);
+    cargo_goose::verify::verify(&goose, &lib, &m).unwrap();
+    // Keep the union size and all field offsets, but exchange the variant tags.
+    let broken = m.replace(
+        "enum AShape { align 8, Circle { r: f64, pad 8 }, Rect { w: f64, h: f64 }, Dot }",
+        "enum AShape { align 8, Rect { w: f64, h: f64 }, Circle { r: f64, pad 8 }, Dot }",
+    );
+    assert_ne!(broken, m);
+    let err = cargo_goose::verify::verify(&goose, &lib, &broken).unwrap_err();
+    assert!(err.contains("zero_copy variant tag differs"), "{err}");
+    // Keep the total size while moving the fields of a strict payload.
+    let broken = m.replace("Rect { w: f64, h: f64 }, Dot", "Rect { h: f64, w: f64 }, Dot");
+    let err = cargo_goose::verify::verify(&goose, &lib, &broken).unwrap_err();
+    assert!(err.contains("AShape::Rect.w"), "{err}");
+}
+
+#[test]
+fn metadata_versions_preserve_the_strict_contract() {
+    let mut json: serde_json::Value = serde_json::from_str(&libloading_json()).unwrap();
+    json["format"] = 1.into();
+    assert!(meta::parse(&json.to_string(), "legacy").unwrap_err().contains("zero_copy exports require metadata format 2"));
+    for f in json["functions"].as_array_mut().unwrap() {
+        f.as_object_mut().unwrap().remove("zero_copy");
+    }
+    let old = meta::parse(&json.to_string(), "legacy").unwrap();
+    assert!(old.functions.iter().all(|f| !f.zero_copy));
 }

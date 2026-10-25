@@ -49,45 +49,38 @@ pub fn package(p: &Plan) -> Result<(), String> {
     let ci = toolchain::crate_info(p.manifest.as_deref())?;
     let host = toolchain::host_triple();
     let targets: Vec<String> = if p.targets.is_empty() { vec![host.clone()] } else { p.targets.clone() };
-    let mut built: BTreeMap<&'static str, Vec<(String, PathBuf)>> = BTreeMap::new();
-    let mut host_lib = None;
-    for t in &targets {
-        let is_host = *t == host;
-        let bo = toolchain::BuildOpts {
-            release: true,
-            features: p.features.clone(),
-            target: if is_host { None } else { Some(t.clone()) },
-            target_dir: None,
-            zig: p.zig && !is_host && !t.contains("apple"),
-        };
-        toolchain::cargo_build(&ci, &bo)?;
-        let lib = toolchain::cdylib_path(&ci, &bo);
-        if !lib.is_file() {
-            return Err(format!("cargo built no {}", lib.display()));
-        }
-        if is_host {
-            host_lib = Some(lib.clone());
-        }
-        built.entry(toolchain::platform_of(Some(t))).or_default().push((t.clone(), lib));
-    }
-    let host_lib = match host_lib {
-        Some(l) => l,
-        None => {
-            // The records are read from a library this machine can open.
-            let bo = toolchain::BuildOpts { release: true, features: p.features.clone(), ..Default::default() };
-            toolchain::cargo_build(&ci, &bo)?;
-            toolchain::cdylib_path(&ci, &bo)
-        }
-    };
+    // Read the host records first: cross-target layout claims cannot be made
+    // from them for strict exports (target cfg can change fields and alignment).
+    let host_build = toolchain::BuildOpts { release: true, features: p.features.clone(), ..Default::default() };
+    toolchain::cargo_build(&ci, &host_build)?;
+    let host_lib = toolchain::cdylib_path(&ci, &host_build);
     let library = meta::read_library(&host_lib)?;
     let desc = format!("{} {}", library.crate_name, library.version);
     let allow = p.allow_runtime.as_deref() == Some(p.info.runtime.as_str());
     toolchain::check_runtime(&p.info, &library.goose_runtime, &desc, allow)?;
     let ns = library.namespace.clone();
-    // A package serves compilers with and without typed builders: results
-    // that need them are counted and copied.
-    let opts = gen::Options { link: gen::Link::Dynamic(ci.lib_name.clone()), typed_builders: false, align: false, reentrant: false };
+    // Portable packages omit typed-builder/aligned-enum/reentrant exports;
+    // ordinary vector results keep the existing count/copy protocol.
+    let opts = gen::Options { link: gen::Link::Dynamic(ci.lib_name.clone()), typed_builders: false, align: false, reentrant: false, emit_interface: p.info.has("emit-interface") };
     let module = gen::generate(&library, &opts)?;
+    let strict = library.functions.iter().any(|f| f.zero_copy && module.contains(&format!("// zero_copy: {}\n", f.symbol)));
+    if strict && targets.iter().any(|t| *t != host) {
+        return Err(format!("zero_copy package exports require target layout verification; only the host target {host} is supported with these metadata records"));
+    }
+    if strict { crate::verify::verify(&p.goose, &library, &module)?; }
+    let mut built: BTreeMap<&'static str, Vec<(String, PathBuf)>> = BTreeMap::new();
+    for t in &targets {
+        let lib = if *t == host { host_lib.clone() } else {
+            let bo = toolchain::BuildOpts {
+                release: true, features: p.features.clone(), target: Some(t.clone()),
+                target_dir: None, zig: p.zig && !t.contains("apple"),
+            };
+            toolchain::cargo_build(&ci, &bo)?;
+            toolchain::cdylib_path(&ci, &bo)
+        };
+        if !lib.is_file() { return Err(format!("cargo built no {}", lib.display())); }
+        built.entry(toolchain::platform_of(Some(t))).or_default().push((t.clone(), lib));
+    }
     crate::write_module(&p.out.join(format!("{ns}.goose")), &module)?;
 
     let mut sidecar = String::new();

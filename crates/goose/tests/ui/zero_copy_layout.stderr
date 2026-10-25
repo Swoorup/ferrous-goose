@@ -1,0 +1,17 @@
+error[E0080]: evaluation panicked: zero_copy requires references with the same layout as Rust
+ --> tests/ui/zero_copy_layout.rs:6:22
+  |
+6 | pub fn reference(_x: &Converted) {}
+  |                      ^ evaluation of `_` failed here
+
+error[E0080]: evaluation panicked: zero_copy requires elements with the same layout as Rust
+ --> tests/ui/zero_copy_layout.rs:9:18
+  |
+9 | pub fn slice(_x: &[Converted]) {}
+  |                  ^ evaluation of `_` failed here
+
+error[E0080]: evaluation panicked: zero_copy requires elements with the same layout as Rust
+  --> tests/ui/zero_copy_layout.rs:12:22
+   |
+12 | pub fn builder(_out: &mut goose::GooseVec<Converted>) {}
+   |                      ^ evaluation of `_` failed here

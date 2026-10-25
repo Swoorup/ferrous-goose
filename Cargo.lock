@@ -200,6 +200,7 @@ dependencies = [
  "cargo-goose",
  "ferrous-goose",
  "libloading",
+ "serde_json",
 ]
 
 [[package]]

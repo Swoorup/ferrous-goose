@@ -15,6 +15,7 @@ goose.workspace = true
 [dev-dependencies]
 cargo-goose = { path = "../../crates/cargo-goose" }
 libloading = "0.8"
+serde_json = "1"
 
 [package.metadata.goose]
 namespace = "cf"

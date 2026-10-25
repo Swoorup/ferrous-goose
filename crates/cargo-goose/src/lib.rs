@@ -9,6 +9,7 @@ pub mod scaffold;
 pub mod sidecar;
 pub mod toolchain;
 pub mod verify;
+mod zero_copy;
 
 use std::path::{Path, PathBuf};
 

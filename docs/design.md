@@ -281,6 +281,9 @@ its checks, `&str` adds UTF-8 validation (linear in the length; take
   relative cost depends on the workload (see the budget). Compatible
   layouts with `align n` avoid the alignment copy fallback.
 
-The current copy paths, measured overhead and a proposed strict zero-copy
-export contract are described in [performance.md](performance.md). That
-contract is a proposal; current exports retain safe copy fallbacks.
+`#[goose::export(zero_copy)]` opts into borrowing in place, with compile-time
+signature/layout checks and failure instead of a misalignment copy. Strict
+span results stream directly into a builder. Ordinary exports retain their
+safe fallbacks; validation remains enabled in both modes. The supported
+shapes, error-path limits and measurements are described in
+[performance.md](performance.md).

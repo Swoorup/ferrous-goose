@@ -91,3 +91,14 @@ Async functions, Rust closures kept as values, trait objects other than
 Every wrapper takes `&Runtime` (or `&mut Runtime` where a builder is
 involved), which is neither `Send` nor `Sync`: the Rust compiler keeps every
 call on the thread that ran `goose_init`.
+
+## Strict exports
+
+`#[goose::export(zero_copy)]` rejects copy-producing signatures and requires
+borrowing in place. Misalignment reports failure instead of allocating a
+fallback copy. Borrowed views, handles and direct builders are supported;
+owned payloads, by-value aggregates and coroutine callbacks are rejected.
+Strict span results stream descriptor records directly into their builder.
+The binding tools require compiler layout verification, even with
+`--no-verify`. See [performance.md](performance.md) for the full contract and
+its failure-path and allocation limits.

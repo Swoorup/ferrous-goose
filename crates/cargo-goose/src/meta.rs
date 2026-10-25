@@ -124,6 +124,8 @@ pub struct Function {
     pub main_thread: bool,
     #[serde(default)]
     pub reentrant: bool,
+    #[serde(default)]
+    pub zero_copy: bool,
     pub c_params: Vec<String>,
     pub c_ret: String,
 }
@@ -146,7 +148,7 @@ pub struct Library {
 }
 
 /// The metadata format and bridge ABI this cargo-goose reads and writes for.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 pub const ABI: u32 = 1;
 
 /// Parses metadata JSON, checking its versions first.
@@ -155,14 +157,17 @@ pub fn parse(json: &str, source: &str) -> Result<Library, String> {
     let format = v.get("format").and_then(|f| f.as_u64()).unwrap_or(0) as u32;
     let abi = v.get("abi").and_then(|f| f.as_u64()).unwrap_or(0) as u32;
     let bridge = v.get("bridge").and_then(|f| f.as_str()).unwrap_or("?");
-    if format != FORMAT || abi != ABI {
+    if !(1..=FORMAT).contains(&format) || abi != ABI {
         return Err(format!(
             "{source} was built with Ferrous Goose {bridge} (metadata format {format}, bridge ABI {abi}); \
-             this cargo-goose {} reads format {FORMAT}, ABI {ABI}. Rebuild the crate against a matching `goose` crate.",
+             this cargo-goose {} reads formats 1..={FORMAT}, ABI {ABI}. Rebuild the crate against a matching `goose` crate.",
             env!("CARGO_PKG_VERSION")
         ));
     }
     let lib: Library = serde_json::from_value(v).map_err(|e| format!("{source}: unexpected metadata: {e}"))?;
+    if format == 1 && lib.functions.iter().any(|f| f.zero_copy) {
+        return Err(format!("{source}: zero_copy exports require metadata format 2"));
+    }
     if !lib.errors.is_empty() {
         return Err(format!("{source}: {}", lib.errors.join("; ")));
     }

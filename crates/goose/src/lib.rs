@@ -44,7 +44,9 @@ pub use value::{align_up, max_size, read_same_layout, write_same_layout, Value};
 
 /// Marks a function Goose may call: `#[goose::export]`,
 /// `#[goose::export(instantiate(T = f32, f64))]`, `#[goose::export(throws)]`,
-/// `#[goose::export(main_thread)]`, `#[goose::export(name = "...")]`.
+/// `#[goose::export(main_thread)]`, `#[goose::export(zero_copy)]`,
+/// `#[goose::export(name = "...")]`. Strict exports retain safety checks and
+/// reject a misaligned argument instead of copying it.
 pub use ferrous_goose_macros::export;
 /// Makes a type a handle Goose holds: `#[goose::handle]`, or
 /// `#[goose::handle(pinned)]` for a type that is not Send + Sync.

@@ -101,7 +101,7 @@ impl core::fmt::Debug for Handle {
 pub const ABI_VERSION: u32 = 1;
 
 /// The metadata format `goose_metadata` writes.
-pub const METADATA_FORMAT: u32 = 1;
+pub const METADATA_FORMAT: u32 = 2;
 
 /// The Goose runtime whose layouts this bridge was written against (what
 /// `goose version` prints). `cargo goose` compares it with the compiler's.

@@ -1,0 +1,43 @@
+error: goose::export(zero_copy): owned inputs require a copy; take a borrowed slice or &str
+ --> tests/ui/zero_copy_owned.rs:2:17
+  |
+2 | pub fn owned(s: String) -> i64 { s.len() as i64 }
+  |                 ^^^^^^
+
+error: goose::export(zero_copy): owned inputs require a copy; take a borrowed slice or &str
+ --> tests/ui/zero_copy_owned.rs:5:21
+  |
+5 | pub fn optional(xs: Option<Vec<i32>>) -> i64 { xs.map_or(0, |v| v.len() as i64) }
+  |                     ^^^^^^
+
+error: goose::export(zero_copy): this result requires a payload copy; return a view of an input slice or write to a builder
+ --> tests/ui/zero_copy_owned.rs:7:1
+  |
+7 | #[goose::export(zero_copy)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `goose::export` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: goose::export(zero_copy): this result requires a payload copy; return a view of an input slice or write to a builder
+  --> tests/ui/zero_copy_owned.rs:10:1
+   |
+10 | #[goose::export(zero_copy)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `goose::export` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: goose::export(zero_copy): this result requires a payload copy; return a view of an input slice or write to a builder
+  --> tests/ui/zero_copy_owned.rs:13:1
+   |
+13 | #[goose::export(zero_copy)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `goose::export` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: goose::export(zero_copy): this result requires a payload copy; return a view of an input slice or write to a builder
+  --> tests/ui/zero_copy_owned.rs:19:1
+   |
+19 | #[goose::export(zero_copy)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `goose::export` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -748,3 +748,6 @@ pub fn nudge_all(hits: &mut [Hit], goose: &goose::Reentry) -> Result<(), goose::
 pub fn lent_in_place(xs: &[i32]) -> bool {
     (xs.as_ptr() as usize) % std::mem::align_of::<i32>() == 0
 }
+
+/// Strict no-fallback exports used by the conformance tests.
+pub mod zero_copy;

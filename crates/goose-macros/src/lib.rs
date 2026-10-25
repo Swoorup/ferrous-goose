@@ -19,6 +19,7 @@ mod types;
 /// Options: `instantiate(T = f32, f64)` for a generic function (one Goose
 /// overload per type), `throws` (the Goose wrapper of a `Result` function
 /// throws the error text through Goose's `exception` module),
+/// `zero_copy` (borrow in place or fail, rejecting copy-producing signatures),
 /// `main_thread` (calls from any other thread abort), `name = "..."` (the
 /// Goose name), `symbol = "..."` (the C symbol).
 #[proc_macro_attribute]

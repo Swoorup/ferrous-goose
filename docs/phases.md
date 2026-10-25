@@ -51,6 +51,7 @@ only async functions and Rust closures kept as values (and the few shapes
 | Wrapper packages over regex, serde_json, image and rusqlite, each with its module and a prebuilt library per platform and architecture | `packages/*`, `cargo goose package`, goose-patches/0006 | examples run with no cargo or rustc on PATH on macOS (arm64) and Linux (arm64); libraries built for macOS (universal), Linux (x86_64, arm64) and Windows (x86_64) |
 | `cargo goose new` and `cargo goose test` | `crates/cargo-goose` | a scaffolded crate's test passes |
 | Versioning: format and ABI versions in records and symbols | `goose::abi`, `goose_abi_1` | `bindings.rs` (`versions_are_checked`) |
+| Strict `#[goose::export(zero_copy)]` exports | macros, no-copy argument holders, mandatory layout verification | compile-fail fixtures, strict shim/allocation tests and `zero_copy.goose` |
 | An overhead budget, measured and published | `bench/` | `bench/RESULTS.md` |
 
 Done when someone with no Rust installed imports a crate-backed package and
