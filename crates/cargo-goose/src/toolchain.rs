@@ -276,7 +276,8 @@ pub fn staticlib_path(c: &CrateInfo, o: &BuildOpts) -> PathBuf {
 pub fn native_static_libs(c: &CrateInfo, o: &BuildOpts) -> Vec<String> {
     let cache = out_dir(c, o).join(format!("{}-native-static-libs.txt", c.lib_name));
     let mut cmd = Command::new(cargo());
-    cmd.args(["rustc", "--lib", "--crate-type", "staticlib"]).arg("--manifest-path").arg(&c.manifest);
+    cmd.args(["rustc", "--color", "never", "--lib", "--crate-type", "staticlib"])
+        .arg("--manifest-path").arg(&c.manifest);
     if o.release {
         cmd.arg("--release");
     }
@@ -293,14 +294,17 @@ pub fn native_static_libs(c: &CrateInfo, o: &BuildOpts) -> Vec<String> {
     if let Ok(out) = cmd.output() {
         for l in String::from_utf8_lossy(&out.stderr).lines() {
             if let Some(i) = l.find("native-static-libs:") {
-                let libs = l[i + "native-static-libs:".len()..].trim().to_string();
-                let _ = std::fs::write(&cache, &libs);
-                return libs.split_whitespace().map(String::from).collect();
+                let libs = native_link_flags(&l[i + "native-static-libs:".len()..]);
+                let _ = std::fs::write(&cache, libs.join(" "));
+                return libs;
             }
         }
     }
     if let Ok(s) = std::fs::read_to_string(&cache) {
-        return s.split_whitespace().map(String::from).collect();
+        // Older versions may have cached a colored diagnostic.
+        let libs = native_link_flags(&s);
+        let _ = std::fs::write(&cache, libs.join(" "));
+        return libs;
     }
     match platform_of(o.target.as_deref()) {
         "macos" => ["-liconv", "-lSystem", "-lc", "-lm"].map(String::from).to_vec(),
@@ -309,6 +313,23 @@ pub fn native_static_libs(c: &CrateInfo, o: &BuildOpts) -> Vec<String> {
             .to_vec(),
         _ => ["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"].map(String::from).to_vec(),
     }
+}
+
+/// Strip terminal CSI formatting before flags enter the linker or JSON report.
+fn native_link_flags(text: &str) -> Vec<String> {
+    let mut plain = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) { break; }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain.split_whitespace().map(String::from).collect()
 }
 
 /// The environment variable the platform's loader searches for a bare
@@ -331,4 +352,25 @@ pub fn loader_path_with(dir: &Path) -> std::ffi::OsString {
         paths.extend(std::env::split_paths(&old));
     }
     std::env::join_paths(paths).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_link_flags;
+
+    #[test]
+    fn native_flags_ignore_terminal_colors() {
+        assert_eq!(native_link_flags(" -liconv -lSystem -lc -lm\u{1b}[0m"),
+                   ["-liconv", "-lSystem", "-lc", "-lm"]);
+        assert_eq!(native_link_flags("\u{1b}[1m-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\u{1b}[0m"),
+                   ["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"]);
+        assert_eq!(native_link_flags("kernel32.lib bcrypt.lib\u{1b}[0m\r\n"),
+                   ["kernel32.lib", "bcrypt.lib"]);
+    }
+
+    #[test]
+    fn native_flags_preserve_plain_cached_values() {
+        assert_eq!(native_link_flags("  -lc  -lm\r\n"), ["-lc", "-lm"]);
+        assert!(native_link_flags("").is_empty());
+    }
 }
