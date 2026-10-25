@@ -76,7 +76,12 @@ jobs:
         run: |
           mkdir -p goose-dist/build
           cp -r .toolchain/goose/stdlib goose-dist/stdlib
-          cp .toolchain/goose/build/goose* goose-dist/build/ 2>/dev/null || true
+          cp -r .toolchain/goose/build/tcclib goose-dist/build/tcclib
+          if [[ -f .toolchain/goose/build/goose.exe ]]; then
+            cp .toolchain/goose/build/goose.exe goose-dist/build/
+          else
+            cp .toolchain/goose/build/goose goose-dist/build/
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: goose-${{ runner.os }}
