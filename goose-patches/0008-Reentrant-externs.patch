@@ -1,4 +1,4 @@
-From 85a15f1e2f1276b6c608e7a16de75b4b87d8fcf8 Mon Sep 17 00:00:00 2001
+From b8e1e3480fb4ca910a3ae848b652a3fef5694b01 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
 Date: Mon, 26 Oct 2026 00:34:28 +1100
 Subject: [PATCH] Support callbacks through reentrant native functions
