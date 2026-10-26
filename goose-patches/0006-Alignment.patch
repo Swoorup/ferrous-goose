@@ -1,28 +1,28 @@
-From 3eb039ffd9140a1dbf8c96d5d7576f64badb6e40 Mon Sep 17 00:00:00 2001
+From a3b25dee6b80de1b80ca49f3821b849e19546311 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 01:04:45 +1100
+Date: Tue, 27 Oct 2026 02:30:24 +1100
 Subject: [PATCH] Support explicit alignment for structs and enums
 
 Preserve declared alignment in variables, arrays and runtime data stacks.
 Validate layouts and report alignment through the native interface metadata.
 ---
- docs/goose_spec.md      | 13 +++++++
+ docs/goose_spec.md      | 13 ++++++++
  src/ast.h               |  7 ++++
  src/capabilities.h      |  2 +-
  src/codegen.h           | 11 +++++-
  src/codegen_construct.h |  1 +
  src/codegen_emit.h      |  1 +
  src/codegen_stmts.h     |  1 +
- src/codegen_types.h     | 75 ++++++++++++++++++++++++++++++++++++++---
+ src/codegen_types.h     | 74 ++++++++++++++++++++++++++++++++++++++---
  src/codegen_values.h    |  1 +
  src/dump.h              |  2 ++
- src/interface.h         |  5 +--
+ src/interface.h         |  4 +--
  src/parser.h            | 36 ++++++++++++++++++--
  src/runtime/runtime.h   |  9 +++++
  src/runtime_inline.h    | 19 ++++++++---
  test/format.py          |  3 ++
  test/run_tests.py       | 10 ++++++
- 16 files changed, 181 insertions(+), 15 deletions(-)
+ 16 files changed, 179 insertions(+), 15 deletions(-)
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
 index 114bb8bd..8e48514c 100644
@@ -84,7 +84,7 @@ index 965ae729..c6cd844d 100644
 -#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs reentrant"
 +#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align reentrant"
 diff --git a/src/codegen.h b/src/codegen.h
-index 14d7aeba..1c4ff73a 100644
+index 75ee2434..9824ef06 100644
 --- a/src/codegen.h
 +++ b/src/codegen.h
 @@ -311,7 +311,16 @@ struct CodeGen {
@@ -118,7 +118,7 @@ index 994ef40d..9403c68f 100644
                  L(flv, ".len = 0;");
                  GenConstruct(init, stk, ft, cat(flv, ".len"));
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 1fa1b2a9..3482e71e 100644
+index e5f3c29d..fe9bb6ec 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
 @@ -855,6 +855,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
@@ -142,7 +142,7 @@ index 8e4fbef6..f4ac5866 100644
      if (own) SaveBase(forlocal, stk, cat(name, ".base"));
      if (d->reusable) {
 diff --git a/src/codegen_types.h b/src/codegen_types.h
-index e42fd637..82213fad 100644
+index e42fd637..c48867d0 100644
 --- a/src/codegen_types.h
 +++ b/src/codegen_types.h
 @@ -240,8 +240,27 @@ inline const char *CodeGen::RelCT(TypeExpr *rt) {
@@ -173,7 +173,7 @@ index e42fd637..82213fad 100644
          case TY_INT: return t->intstorage == IS_VARINT ? 1 : IntSize(t->intstorage);
          case TY_FLT: return t->fltstorage == FS_F32 ? 4 : 8;
          case TY_REF: return t->ref->lenstorage >= 0 ?
-@@ -280,18 +299,51 @@ inline CodeGen::Layout CodeGen::LayoutFields(const vector<Field> &fields,
+@@ -280,18 +299,50 @@ inline CodeGen::Layout CodeGen::LayoutFields(const vector<Field> &fields,
      return lo;
  }
  
@@ -181,7 +181,7 @@ index e42fd637..82213fad 100644
 +// at least as aligned, `base` bytes into it (an enum's payload), and an
 +// aligned type's size must be a multiple of its alignment, so that its
 +// elements stay aligned too.
-+inline void CheckAlignedLayout(CodeGen &cg, string_view what, Line line, int64_t align, int64_t base,
++inline void CheckAlignedLayout(CodeGen &cg, string_view what, int64_t align, int64_t base,
 +                               const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
 +                               const CodeGen::Layout &lo) {
 +    for (size_t i = 0; i < fields.size(); i++) {
@@ -195,7 +195,6 @@ index e42fd637..82213fad 100644
 +            cg.Fail(fields[i].line, cat(what, ": field ", fields[i].name, " at offset ", base + lo.offs[i],
 +                                        " is not a multiple of its alignment ", fa, ": add a pad before it"));
 +    }
-+    (void)line;
 +}
 +
  inline const CodeGen::Layout &CodeGen::StructLayout(StructInst *si) {
@@ -205,7 +204,7 @@ index e42fd637..82213fad 100644
 -    return layouts[key] = LayoutFields(si->st->fields, si->ftypes);
 +    auto &lo = layouts[key] = LayoutFields(si->st->fields, si->ftypes);
 +    auto a = si->st->align;
-+    CheckAlignedLayout(*this, cat("struct ", si->st->qname), si->st->line, a, 0, si->st->fields, si->ftypes, lo);
++    CheckAlignedLayout(*this, cat("struct ", si->st->qname), a, 0, si->st->fields, si->ftypes, lo);
 +    if (a > 1 && lo.size % a)
 +        Fail(si->st->line, cat("struct ", si->st->qname, " has align ", a, " but is ", lo.size,
 +                               " bytes: add pad ", a - lo.size % a, " so its elements stay aligned"));
@@ -220,14 +219,14 @@ index e42fd637..82213fad 100644
      if (it != layouts.end()) return it->second;
 -    return layouts[key] = LayoutFields(ei->en->variants[vi].fields, ei->vftypes[vi]);
 +    auto &lo = layouts[key] = LayoutFields(ei->en->variants[vi].fields, ei->vftypes[vi]);
-+    CheckAlignedLayout(*this, cat("enum ", ei->en->qname), ei->en->line, ei->en->align,
++    CheckAlignedLayout(*this, cat("enum ", ei->en->qname), ei->en->align,
 +                       ei->en->align > 1 ? ei->en->align : 0, ei->en->variants[vi].fields,
 +                       ei->vftypes[vi], lo);
 +    return lo;
  }
  
  inline int64_t CodeGen::FixedSize(TypeExpr *t) {
-@@ -317,6 +369,11 @@ inline int64_t CodeGen::FixedSize(TypeExpr *t) {
+@@ -317,6 +368,11 @@ inline int64_t CodeGen::FixedSize(TypeExpr *t) {
              int64_t maxp = 0;
              for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
                  maxp = std::max(maxp, VariantLayout(ei, (int)vi).size);
@@ -239,7 +238,7 @@ index e42fd637..82213fad 100644
              return TagSize(ei->en) + maxp;
          }
          case TY_VARIANT: {
-@@ -574,6 +631,9 @@ inline string CodeGen::CT(TypeExpr *t) {
+@@ -574,6 +630,9 @@ inline string CodeGen::CT(TypeExpr *t) {
                  Append(d, "typedef struct { ", e, " e[", k ? k : 1, "]; } ", name, ";\n");
              } else {
                  assert(a.akind == A_LIMITED && ArrSize(t->arr) >= 0);
@@ -249,7 +248,7 @@ index e42fd637..82213fad 100644
                  Append(d, "typedef struct { ", IntCT(LenStore(t->arr)), " len; ", e, " e[",
                         ArrSize(t->arr) ? ArrSize(t->arr) : 1, "]; } ", name, ";\n");
              }
-@@ -581,7 +641,9 @@ inline string CodeGen::CT(TypeExpr *t) {
+@@ -581,7 +640,9 @@ inline string CodeGen::CT(TypeExpr *t) {
          }
          case TY_STRUCT: {
              auto si = SI(t);
@@ -260,7 +259,7 @@ index e42fd637..82213fad 100644
              if (EmptyLayout(si->st->fields)) Append(d, "    uint8_t gs_empty;\n");
              else EmitCFields(d, si->st->fields, si->ftypes);
              Append(d, "};\n");
-@@ -601,7 +663,12 @@ inline string CodeGen::CT(TypeExpr *t) {
+@@ -601,7 +662,12 @@ inline string CodeGen::CT(TypeExpr *t) {
              assert(!t->enu->varmode);
              auto ei = EIOf(t);
              EnsureTagEnum(ei);
@@ -307,28 +306,27 @@ index 59fea177..25fe128f 100644
          NL(s, ind + 1);
          s += v.name;
 diff --git a/src/interface.h b/src/interface.h
-index 7890a0cf..899b5886 100644
+index 7e5dbbb8..0d9c8f2f 100644
 --- a/src/interface.h
 +++ b/src/interface.h
-@@ -170,7 +170,8 @@ struct InterfaceWriter {
-                 JsonQuote(out, si->st->qname);
-                 out += ",\"doc\":";
-                 JsonQuote(out, si->st->doc);
--                Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"fields\":");
-+                Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"align\":", si->st->align,
-+                       ",\"fields\":");
-                 Fields(si->st->fields, si->ftypes, lo);
-                 out += "}";
-                 if (types.back() != '[') types += ",";
-@@ -191,7 +192,7 @@ struct InterfaceWriter {
-             out += ",\"doc\":";
-             JsonQuote(out, ei->en->doc);
-             Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
--                   ",\"variants\":[");
-+                   ",\"align\":", ei->en->align, ",\"variants\":[");
-             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
-                 if (vi) out += ",";
-                 auto &v = ei->en->variants[vi];
+@@ -146,7 +146,7 @@ struct InterfaceWriter {
+         Names(out, si->st->name, si->st->qname);
+         out += ',';
+         StringField(out, "doc", si->st->doc);
+-        Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"align\":", 1, ",\"fields\":");
++        Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"align\":", si->st->align, ",\"fields\":");
+         Fields(out, si->st->fields, si->ftypes, lo);
+         out += '}';
+     }
+@@ -159,7 +159,7 @@ struct InterfaceWriter {
+         out += ',';
+         StringField(out, "doc", ei->en->doc);
+         Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
+-               ",\"align\":", 1, ",\"variants\":[");
++               ",\"align\":", ei->en->align, ",\"variants\":[");
+         for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+             if (vi) out += ',';
+             auto &v = ei->en->variants[vi];
 diff --git a/src/parser.h b/src/parser.h
 index 1852b14e..337385d4 100644
 --- a/src/parser.h
@@ -476,7 +474,7 @@ index 46116e78..d93ae892 100644
       'extern reentrant fn visit(x:i64)->i64;\nextern "lib"{reentrant fn callback();}\n',
       'extern reentrant fn visit(x: i64) -> i64;\nextern "lib" { reentrant fn callback(); }\n'),
 diff --git a/test/run_tests.py b/test/run_tests.py
-index 09db60d9..1b036aee 100755
+index 4bd54939..4beb29a0 100755
 --- a/test/run_tests.py
 +++ b/test/run_tests.py
 @@ -2101,6 +2101,16 @@ def main():

@@ -1,18 +1,20 @@
-From 46cb159d0873ac6e1cb87555704fbdf453e5ed44 Mon Sep 17 00:00:00 2001
+From 6157b6af16d84b7c7fb31642965a7bafb5024116 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 01:02:08 +1100
+Date: Tue, 27 Oct 2026 02:24:35 +1100
 Subject: [PATCH] Describe the native interface as JSON
 
 Expose compiler-resolved exports and reachable layouts for language-neutral
 binding generation and ABI verification through --emit-interface.
 ---
- docs/goose_spec.md |   9 ++
- src/capabilities.h |   2 +-
- src/interface.h    | 221 +++++++++++++++++++++++++++++++++++++++++++++
- src/main.cpp       |  22 ++++-
- test/run_tests.py  |  18 ++++
- 5 files changed, 269 insertions(+), 3 deletions(-)
+ docs/goose_spec.md     |   9 ++
+ src/capabilities.h     |   2 +-
+ src/interface.h        | 211 +++++++++++++++++++++++++++++++++++++++++
+ src/main.cpp           |  22 ++++-
+ test/interface_json.py |  54 +++++++++++
+ test/run_tests.py      |  27 ++++++
+ 6 files changed, 322 insertions(+), 3 deletions(-)
  create mode 100644 src/interface.h
+ create mode 100644 test/interface_json.py
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
 index a85ae506..c3ee3240 100644
@@ -46,16 +48,12 @@ index 0e629230..af25e01f 100644
 +#define GOOSE_FEATURES "typed-builders export-results emit-interface"
 diff --git a/src/interface.h b/src/interface.h
 new file mode 100644
-index 00000000..7890a0cf
+index 00000000..7e5dbbb8
 --- /dev/null
 +++ b/src/interface.h
-@@ -0,0 +1,221 @@
-+// Goose compiler — the program's C interface as JSON (`--emit-interface`):
-+// its export fns with their parameters and results, and the layout of
-+// every struct and enum they reach, as the C backend lays them out (C.2).
-+// What a binding generator in another language  builds its side from, and what it checks a
-+// binding it wrote against. Written by the backend, which owns the layouts;
-+// `goose check --emit-interface` runs it for that and writes nothing else.
+@@ -0,0 +1,211 @@
++// The compiler-resolved C interface: exports and the layouts of the types
++// they reach. Binding generators use this JSON to build and check adapters.
 +#pragma once
 +
 +namespace goose {
@@ -63,12 +61,24 @@ index 00000000..7890a0cf
 +struct InterfaceWriter {
 +    CodeGen &cg;
 +    Ast &ast;
-+    string out;
 +    vector<StructInst *> structs;
 +    vector<EnumInst *> enums;
 +    set<const void *> seen;
 +
-+    void Type(TypeExpr *t) {
++    static void StringField(string &out, string_view key, string_view value) {
++        JsonQuote(out, key);
++        out += ':';
++        JsonQuote(out, value);
++    }
++
++    static void Names(string &out, string_view name, string_view qname) {
++        out += '{';
++        StringField(out, "name", name);
++        out += ',';
++        StringField(out, "qname", qname);
++    }
++
++    void Type(string &out, TypeExpr *t) {
 +        switch (t->kind) {
 +            case TY_INT:
 +                Append(out, "{\"prim\":\"", IntStorageName(t->intstorage), "\"}");
@@ -82,191 +92,173 @@ index 00000000..7890a0cf
 +            case TY_STRUCT: {
 +                auto si = cg.SI(t);
 +                if (seen.insert(si).second) structs.push_back(si);
-+                out += "{\"struct\":";
-+                JsonQuote(out, si->st->qname);
-+                out += "}";
++                out += '{';
++                StringField(out, "struct", si->st->qname);
++                out += '}';
 +                return;
 +            }
 +            case TY_ENUM: {
 +                auto ei = cg.EIOf(t);
 +                if (seen.insert(ei).second) enums.push_back(ei);
-+                out += "{\"enum\":";
-+                JsonQuote(out, ei->en->qname);
-+                out += "}";
++                out += '{';
++                StringField(out, "enum", ei->en->qname);
++                out += '}';
 +                return;
 +            }
 +            case TY_ARRAY:
 +                if (t->arr->akind == A_FIXED) {
 +                    out += "{\"array\":{\"elem\":";
-+                    Type(t->arr->sub);
++                    Type(out, t->arr->sub);
 +                    Append(out, ",\"len\":", cg.ArrSize(t->arr), "}}");
 +                    return;
 +                }
 +                break;
 +            case TY_SLICE:
 +                out += "{\"slice\":{\"elem\":";
-+                Type(t->sub);
++                Type(out, t->sub);
 +                Append(out, ",\"const\":", t->cq ? "true" : "false", "}}");
 +                return;
 +            case TY_REF:
-+                if (t->ref->sub->kind == TY_ARRAY && t->ref->sub->arr->akind == A_GROW) {
++                if (IsExportBuilder(t)) {
 +                    out += "{\"builder\":{\"elem\":";
-+                    Type(t->ref->sub->arr->sub);
++                    Type(out, t->ref->sub->arr->sub);
 +                    out += "}}";
 +                    return;
 +                }
 +                out += "{\"ref\":{\"to\":";
-+                Type(t->ref->sub);
++                Type(out, t->ref->sub);
 +                Append(out, ",\"const\":", t->cq ? "true" : "false", "}}");
 +                return;
 +            default:
 +                break;
 +        }
-+        string s;
-+        t->Dump(s);
-+        out += "{\"other\":";
-+        JsonQuote(out, s);
-+        out += "}";
++        string text;
++        t->Dump(text);
++        out += '{';
++        StringField(out, "other", text);
++        out += '}';
 +    }
 +
-+    void Text(TypeExpr *t) {
-+        string s;
-+        t->Dump(s);
-+        JsonQuote(out, s);
++    void TypedFields(string &out, TypeExpr *t) {
++        out += "\"type\":";
++        Type(out, t);
++        out += ',';
++        string text;
++        t->Dump(text);
++        StringField(out, "text", text);
 +    }
 +
-+    void Fields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
++    void Fields(string &out, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
 +                const CodeGen::Layout &lo) {
-+        out += "[";
-+        auto first = true;
++        out += '[';
 +        for (size_t i = 0; i < fields.size(); i++) {
++            if (i) out += ',';
 +            auto &f = fields[i];
-+            if (!first) out += ",";
-+            first = false;
 +            auto off = i < lo.offs.size() ? lo.offs[i] : 0;
 +            if (f.ispad || !ftypes[i]) {
 +                auto next = i + 1 < lo.offs.size() ? lo.offs[i + 1] : lo.size;
 +                Append(out, "{\"pad\":", next - off, ",\"offset\":", off, "}");
 +                continue;
 +            }
-+            out += "{\"name\":";
-+            JsonQuote(out, f.name);
-+            out += ",\"type\":";
-+            Type(ftypes[i]);
-+            out += ",\"text\":";
-+            Text(ftypes[i]);
++            out += '{';
++            StringField(out, "name", f.name);
++            out += ',';
++            TypedFields(out, ftypes[i]);
 +            Append(out, ",\"offset\":", off, ",\"size\":", cg.FixedSize(ftypes[i]), "}");
 +        }
-+        out += "]";
++        out += ']';
++    }
++
++    void Export(string &out, FnSpec *sp) {
++        auto sf = sp->sf;
++        Names(out, sf->name, sf->qname);
++        out += ',';
++        StringField(out, "symbol", sf->cname);
++        out += ',';
++        StringField(out, "doc", sf->doc);
++        out += ",\"params\":[";
++        for (size_t i = 0; i < sp->argtypes.size(); i++) {
++            if (i) out += ',';
++            out += '{';
++            StringField(out, "name", i < sf->params.size() ? sf->params[i].name : string_view("arg"));
++            out += ',';
++            TypedFields(out, sp->argtypes[i]);
++            out += '}';
++        }
++        out += "],\"results\":[";
++        for (size_t i = 0; i < sp->rets.size(); i++) {
++            if (i) out += ',';
++            out += '{';
++            TypedFields(out, sp->rets[i]);
++            out += '}';
++        }
++        out += "]}";
++    }
++
++    void Struct(string &out, StructInst *si) {
++        auto &lo = cg.StructLayout(si);
++        Names(out, si->st->name, si->st->qname);
++        out += ',';
++        StringField(out, "doc", si->st->doc);
++        Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"align\":", 1, ",\"fields\":");
++        Fields(out, si->st->fields, si->ftypes, lo);
++        out += '}';
++    }
++
++    void Enum(string &out, EnumInst *ei) {
++        int64_t maxp = 0;
++        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
++            maxp = std::max(maxp, cg.VariantLayout(ei, (int)vi).size);
++        Names(out, ei->en->name, ei->en->qname);
++        out += ',';
++        StringField(out, "doc", ei->en->doc);
++        Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
++               ",\"align\":", 1, ",\"variants\":[");
++        for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
++            if (vi) out += ',';
++            auto &v = ei->en->variants[vi];
++            out += '{';
++            StringField(out, "name", v.name);
++            Append(out, ",\"tag\":", vi, ",\"fields\":");
++            Fields(out, v.fields, ei->vftypes[vi], cg.VariantLayout(ei, (int)vi));
++            out += '}';
++        }
++        out += "]}";
 +    }
 +
 +    string Write(const string &runtime, const string &features) {
-+        out = "{\"format\":1,\"goose_runtime\":";
-+        JsonQuote(out, runtime);
-+        out += ",\"features\":";
-+        JsonQuote(out, features);
++        string out = "{\"format\":1,";
++        StringField(out, "goose_runtime", runtime);
++        out += ',';
++        StringField(out, "features", features);
 +        out += ",\"sources\":[";
 +        for (size_t i = 0; i < ast.sources.size(); i++) {
-+            if (i) out += ",";
++            if (i) out += ',';
 +            JsonQuote(out, ast.sources[i].first);
 +        }
 +        out += "],\"exports\":[";
-+        auto first = true;
-+        for (auto sf : ast.functions) {
-+            if (!sf->isexport || sf->specs.size() != 1) continue;
-+            auto sp = sf->specs[0];
-+            if (!first) out += ",";
-+            first = false;
-+            out += "{\"name\":";
-+            JsonQuote(out, sf->name);
-+            out += ",\"qname\":";
-+            JsonQuote(out, sf->qname);
-+            out += ",\"symbol\":";
-+            JsonQuote(out, sf->cname);
-+            out += ",\"doc\":";
-+            JsonQuote(out, sf->doc);
-+            out += ",\"params\":[";
-+            for (size_t i = 0; i < sp->argtypes.size(); i++) {
-+                if (i) out += ",";
-+                out += "{\"name\":";
-+                JsonQuote(out, i < sf->params.size() ? sf->params[i].name : string_view("arg"));
-+                out += ",\"type\":";
-+                Type(sp->argtypes[i]);
-+                out += ",\"text\":";
-+                Text(sp->argtypes[i]);
-+                out += "}";
-+            }
-+            out += "],\"results\":[";
-+            for (size_t i = 0; i < sp->rets.size(); i++) {
-+                if (i) out += ",";
-+                out += "{\"type\":";
-+                Type(sp->rets[i]);
-+                out += ",\"text\":";
-+                Text(sp->rets[i]);
-+                out += "}";
-+            }
-+            out += "]}";
++        for (size_t i = 0; i < cg.exports.size(); i++) {
++            if (i) out += ',';
++            Export(out, cg.exports[i]);
 +        }
-+        // The types the exports reach, and the ones those reach.
-+        string types = "],\"structs\":[";
-+        string enumtext = "],\"enums\":[";
-+        for (size_t k = 0, e = 0; k < structs.size() || e < enums.size();) {
-+            if (k < structs.size()) {
-+                auto si = structs[k++];
-+                auto save = std::move(out);
-+                out.clear();
-+                auto &lo = cg.StructLayout(si);
-+                out += "{\"name\":";
-+                JsonQuote(out, si->st->name);
-+                out += ",\"qname\":";
-+                JsonQuote(out, si->st->qname);
-+                out += ",\"doc\":";
-+                JsonQuote(out, si->st->doc);
-+                Append(out, ",\"size\":", lo.size ? lo.size : 1, ",\"fields\":");
-+                Fields(si->st->fields, si->ftypes, lo);
-+                out += "}";
-+                if (types.back() != '[') types += ",";
-+                types += out;
-+                out = std::move(save);
-+                continue;
++        // Emitting a type can discover more structs or enums, including a
++        // struct first reached through an enum. Drain both queues together.
++        string types, variants;
++        for (size_t s = 0, e = 0; s < structs.size() || e < enums.size();) {
++            if (s < structs.size()) {
++                if (s) types += ',';
++                Struct(types, structs[s++]);
++            } else {
++                if (e) variants += ',';
++                Enum(variants, enums[e++]);
 +            }
-+            auto ei = enums[e++];
-+            auto save = std::move(out);
-+            out.clear();
-+            int64_t maxp = 0;
-+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-+                maxp = std::max(maxp, cg.VariantLayout(ei, (int)vi).size);
-+            out += "{\"name\":";
-+            JsonQuote(out, ei->en->name);
-+            out += ",\"qname\":";
-+            JsonQuote(out, ei->en->qname);
-+            out += ",\"doc\":";
-+            JsonQuote(out, ei->en->doc);
-+            Append(out, ",\"tag_size\":", cg.TagSize(ei->en), ",\"size\":", cg.TagSize(ei->en) + maxp,
-+                   ",\"variants\":[");
-+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
-+                if (vi) out += ",";
-+                auto &v = ei->en->variants[vi];
-+                out += "{\"name\":";
-+                JsonQuote(out, v.name);
-+                Append(out, ",\"tag\":", vi, ",\"fields\":");
-+                Fields(v.fields, ei->vftypes[vi], cg.VariantLayout(ei, (int)vi));
-+                out += "}";
-+            }
-+            out += "]}";
-+            if (enumtext.back() != '[') enumtext += ",";
-+            enumtext += out;
-+            out = std::move(save);
 +        }
-+        out += types;
-+        out += enumtext;
-+        out += "]}\n";
-+        return out;
++        return cat(out, "],\"structs\":[", types, "],\"enums\":[", variants, "]}\n");
 +    }
 +};
 +
 +inline string InterfaceJson(CodeGen &cg, Ast &ast, const string &runtime, const string &features) {
-+    InterfaceWriter w { cg, ast, {}, {}, {}, {} };
++    InterfaceWriter w { cg, ast, {}, {}, {} };
 +    return w.Write(runtime, features);
 +}
 +
@@ -339,8 +331,68 @@ index 0af5a75b..47be09ca 100644
          // The packages whose native parts the program needs, which a JIT
          // run takes functions from and a build links: its own, when it has
          // one, and every package an extern fn it calls was declared in,
+diff --git a/test/interface_json.py b/test/interface_json.py
+new file mode 100644
+index 00000000..ab78c03f
+--- /dev/null
++++ b/test/interface_json.py
+@@ -0,0 +1,54 @@
++"""Check the public interface schema, nested type discovery and JSON escaping."""
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++SOURCE = '''namespace probe;
++// A "leaf" with a backslash \\ and unicode λ.
++struct Leaf { x: i16, y: u8 }
++enum Choice { Value { payload: Leaf[2] }, Empty }
++struct Root { choice: Choice }
++export "inspect_root" fn inspect(root: const Root&) -> const u8[:] { return "ok"; }
++export fn fill(n: i64, out: i64[>..]&) -> i64, bool { return n, true; }
++'''
++
++
++def check_interface_json(exe, base=None):
++    with tempfile.TemporaryDirectory(prefix="interface schema ", dir=base) as tmp:
++        source = Path(tmp) / "schema.goose"
++        source.write_text(SOURCE, encoding="utf-8")
++        result = subprocess.run([str(exe), "check", "--emit-interface", "json", str(source)],
++                                capture_output=True, text=True, encoding="utf-8", timeout=60)
++        if result.returncode:
++            raise RuntimeError(result.stdout + result.stderr)
++        data = json.loads(result.stdout)
++        assert data["format"] == 1 and len(data["sources"]) == 1
++        exports = {e["name"]: e for e in data["exports"]}
++        assert exports["inspect"]["symbol"] == "inspect_root"
++        assert exports["inspect"]["params"][0]["type"] == {
++            "ref": {"to": {"struct": "probe::Root"}, "const": True}}
++        assert exports["fill"]["params"][1]["type"] == {"builder": {"elem": {"prim": "i64"}}}
++        assert [r["type"] for r in exports["fill"]["results"]] == [{"prim": "i64"}, {"prim": "bool"}]
++        structs = {s["name"]: s for s in data["structs"]}
++        assert set(structs) == {"Root", "Leaf"}
++        leaf = structs["Leaf"]
++        assert leaf["size"] == 3 and leaf["align"] == 1
++        assert '"leaf"' in leaf["doc"] and "\\" in leaf["doc"] and "λ" in leaf["doc"]
++        assert [(f["offset"], f["size"]) for f in leaf["fields"]] == [(0, 2), (2, 1)]
++        choice, = data["enums"]
++        assert choice["name"] == "Choice" and choice["tag_size"] == 1 and choice["size"] == 7
++        assert [v["tag"] for v in choice["variants"]] == [0, 1]
++        payload, = choice["variants"][0]["fields"]
++        assert payload["type"] == {"array": {"elem": {"struct": "probe::Leaf"}, "len": 2}}
++        assert payload["offset"] == 0 and payload["size"] == 6
++        assert structs["Root"]["size"] == 7
++
++
++if __name__ == "__main__":
++    compiler = Path(sys.argv[1]).resolve()
++    if not compiler.exists():
++        compiler = compiler.with_suffix(".exe")
++    check_interface_json(compiler)
++    print("interface JSON: nested layouts, builders, results and escaped docs passed")
 diff --git a/test/run_tests.py b/test/run_tests.py
-index 9eaaf42b..d587a6ec 100755
+index 9eaaf42b..165a6194 100755
 --- a/test/run_tests.py
 +++ b/test/run_tests.py
 @@ -2075,6 +2075,24 @@ def main():
@@ -368,3 +420,19 @@ index 9eaaf42b..d587a6ec 100755
          # Less than a page or two of data stack is no reservation to run on.
          code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
          checks.append(("check --stack-reserve 5000 (refused)",
+@@ -2266,6 +2284,15 @@ def main():
+             r.fail("language server", str(e))
+     r.show_task(lsp_protocol)
+ 
++    def native_interface_json():
++        from interface_json import check_interface_json
++        try:
++            check_interface_json(exe, gendir)
++            r.ok("native interface JSON: nested layouts and escaped documentation")
++        except (AssertionError, ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
++            r.fail("native interface JSON", str(e))
++    r.show_task(native_interface_json)
++
+     r.section("native builds, packages and runtime I/O")
+ 
+     def extern_types():

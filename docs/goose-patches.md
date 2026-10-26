@@ -160,7 +160,9 @@ parameters use runtime scratch stacks, initialized on first use and reset
 for subsequent calls using them. The returned contents are valid until the
 next exported call. Rust wrappers enforce this lifetime with `&mut Runtime`;
 other hosts must enforce it themselves. Programs without exported builder
-parameters reserve no export scratch stacks.
+parameters reserve no export scratch stacks. Export signatures and the
+maximum scratch requirement are collected once during code generation;
+this does not change the public C calling convention.
 
 ## 0002: Interface metadata
 
@@ -248,8 +250,11 @@ The SDK's automatic end-of-program handle diagnostic also needs the hook.
 Native providers can name a static initializer for the same purpose.
 The SDK registers optional handle diagnostics at shutdown. Other native
 libraries can register their own cleanup callbacks. Hook delivery costs
-startup work; registered callbacks cost shutdown work. The current
-compiler also emits a shutdown-hook call when no hooks are registered.
+startup work; registered callbacks cost shutdown work. The normal-return
+hook call is omitted for programs with no extern calls, custom C headers,
+or native packages. Other programs retain it conservatively, since their
+native code may register a callback. The shared runtime still checks hooks
+on explicit exit and abort paths.
 
 ### Calling back into Goose
 
@@ -295,7 +300,10 @@ with strict zero-copy bindings.
 
 The formatter and source dump retain the `reentrant` modifier. Callbacks
 require the program thread and cannot access mutable `var` globals,
-including through callees. Rust exports taking `Reentry` cannot
+including through callees. Each export's reachable functions are checked
+independently; recursive cycles cannot hide global access or make the
+answer depend on declaration order. Safe recursion remains supported.
+Rust exports taking `Reentry` cannot
 also take explicit builders or closure callbacks. The token is supplied by
 the shim, not by a Goose argument.
 
@@ -482,19 +490,21 @@ caller and callee bodies at `-O0`, and identical inlined caller bodies at
 `-O2`. This checks that example's code generation, not every program's
 latency.
 
-The current series is not strictly zero-cost when unused. It emits an
-empty callback-registration function for programs without exports and a
-shutdown-hook call even when no hooks are registered. Clang `-O2` removed
-the empty registration in the comparison; the shutdown call remained.
-Programs with exports receive callback-table metadata even without a
-reentrant call. Existing dynamic libraries are also probed for the optional
-hook symbol, even if they do not use this SDK.
+Programs without exports emit no callback-registration function or call.
+Programs without extern calls, custom C headers or native packages also
+omit the normal-return shutdown-hook call. For the all-Goose example
+above, the generated initialization and `main` bodies now match stock at
+both `-O0` and `-O2`, as do the user-function bodies. This does not depend
+on the C optimizer removing empty calls.
 
-These are program initialization/shutdown and code-size effects, separate
-from ordinary function and loop bodies. Making unused hook and callback
-machinery conditional is a possible follow-up; the consolidation preserves
-current behavior. See [compiler costs](performance.md#compiler-and-runtime-costs)
-for the cost table and limits of the measurements.
+Programs with exports retain callback-table metadata even without a
+reentrant call. Native programs retain shutdown handling conservatively;
+loaded libraries are probed for the optional hook symbol. Runtime
+headers/helpers remain present, and the shared runtime's explicit exit
+and abort paths still check shutdown hooks. The series therefore does not
+promise identical binary size or zero cost on every unused-feature path.
+See [compiler costs](performance.md#compiler-and-runtime-costs) for the cost
+table and measurement limits.
 
 ## Maintaining the series
 

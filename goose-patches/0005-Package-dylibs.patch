@@ -1,15 +1,18 @@
-From d9ced9ac7ee0ebf99f2b3c77c5b91d09decbaae4 Mon Sep 17 00:00:00 2001
+From d433779217ef9cbb193371cf4b88880f01bda9eb Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 01:03:39 +1100
+Date: Tue, 27 Oct 2026 02:30:24 +1100
 Subject: [PATCH] Resolve package libraries relative to their package
 
 Resolve package-local shared libraries and platform/architecture overrides
 so prebuilt native dependencies can be distributed with their Goose module.
 ---
- docs/packages.md   |  8 ++++++++
- src/capabilities.h |  2 +-
- src/packages.h     | 31 +++++++++++++++++++++++++++++++
- 3 files changed, 40 insertions(+), 1 deletion(-)
+ docs/packages.md       |  8 +++++
+ src/capabilities.h     |  2 +-
+ src/packages.h         | 26 ++++++++++++----
+ test/package_dylibs.py | 67 ++++++++++++++++++++++++++++++++++++++++++
+ test/run_tests.py      |  9 ++++++
+ 5 files changed, 106 insertions(+), 6 deletions(-)
+ create mode 100644 test/package_dylibs.py
 
 diff --git a/docs/packages.md b/docs/packages.md
 index 54f282a1..befa422d 100644
@@ -41,7 +44,7 @@ index 6210947f..965ae729 100644
 -#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build reentrant"
 +#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs reentrant"
 diff --git a/src/packages.h b/src/packages.h
-index f5183b81..75234f77 100644
+index f5183b81..7a889c7e 100644
 --- a/src/packages.h
 +++ b/src/packages.h
 @@ -139,6 +139,10 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
@@ -55,44 +58,137 @@ index f5183b81..75234f77 100644
      bf.CheckKeys(known);
      #ifdef _WIN32
          const char *platform = "_windows";
-@@ -178,6 +182,12 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+@@ -170,23 +174,35 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+     // to open on every platform, and the suffixed lists on one; the
+     // generated C carries all of them, the runtime picking its own. A name
+     // no block declares is refused once every block is known (ParseProgram).
+-    for (auto suffix : { "", "_windows", "_linux", "_macos" }) {
+-        auto key = cat("dylibs", suffix);
++    auto read_dylibs = [&](const string &key, const char *platform, bool replace_existing) {
+         for (auto &e : bf.Strings(key)) {
+             auto eq = e.find('=');
+             if (eq == string::npos || eq == 0 || eq + 1 == e.size())
                  throw CompileError { cat(pkg.sidecar, ": ", key, " entry \"", e,
                                           "\" is written name=spelling") };
              auto name = e.substr(0, eq), spelling = e.substr(eq + 1);
-+            // A package's `./` spelling is a file of its own, which it ships
-+            // (prebuilt libraries per platform): the
-+            // path from its root, made absolute where the program finds it.
-+            // The program's own keeps meaning its resource directory.
++            // A package's ./ path is its own file; the program's keeps
++            // referring to its resource directory at run time.
 +            if (!isprogram && spelling.rfind("./", 0) == 0)
 +                spelling = ForwardSlashes(AbsolutePath(cat(pkg.root, spelling.substr(2))));
              auto it = std::find_if(pkg.dylibs.begin(), pkg.dylibs.end(),
                                     [&](auto &d) { return d.name == name; });
              if (it == pkg.dylibs.end()) it = pkg.dylibs.insert(it, DylibSpelling { name });
-@@ -187,6 +197,27 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
+-            auto &slot = *suffix ? it->On(suffix) : it->any;
+-            if (!slot.empty())
++            auto &slot = *platform ? it->On(platform) : it->any;
++            if (!replace_existing && !slot.empty())
+                 throw CompileError { cat(pkg.sidecar, ": ", key, " maps ", name, " twice") };
              slot = spelling;
          }
-     }
+-    }
++    };
++    for (auto suffix : { "", "_windows", "_linux", "_macos" })
++        read_dylibs(cat("dylibs", suffix), suffix, false);
 +    #if defined(__aarch64__) || defined(_M_ARM64)
 +        const char *arch = "_arm64";
 +    #else
 +        const char *arch = "_x86_64";
 +    #endif
-+    for (auto os : { "_windows", "_linux", "_macos" }) {
-+        auto key = cat("dylibs", os, arch);
-+        for (auto &e : bf.Strings(key)) {
-+            auto eq = e.find('=');
-+            if (eq == string::npos || eq == 0 || eq + 1 == e.size())
-+                throw CompileError { cat(pkg.sidecar, ": ", key, " entry \"", e,
-+                                         "\" is written name=spelling") };
-+            auto name = e.substr(0, eq), spelling = e.substr(eq + 1);
-+            if (!isprogram && spelling.rfind("./", 0) == 0)
-+                spelling = ForwardSlashes(AbsolutePath(cat(pkg.root, spelling.substr(2))));
-+            auto it = std::find_if(pkg.dylibs.begin(), pkg.dylibs.end(),
-+                                   [&](auto &d) { return d.name == name; });
-+            if (it == pkg.dylibs.end()) it = pkg.dylibs.insert(it, DylibSpelling { name });
-+            it->On(os) = spelling;
-+        }
-+    }
++    for (auto os : { "_windows", "_linux", "_macos" })
++        read_dylibs(cat("dylibs", os, arch), os, true);
      if (!pkg.csources.empty() && !pkg.cmake_target.empty())
          throw CompileError { cat(pkg.sidecar, ": a package has either c_sources or a cmake_target") };
      pkg.native_build = bf.Strings("native_build");
+diff --git a/test/package_dylibs.py b/test/package_dylibs.py
+new file mode 100644
+index 00000000..0bb32736
+--- /dev/null
++++ b/test/package_dylibs.py
+@@ -0,0 +1,67 @@
++"""Check package-relative library paths and platform/architecture precedence."""
++from pathlib import Path
++import platform
++import re
++import subprocess
++import sys
++import tempfile
++
++
++def check_package_dylibs(exe, base=None):
++    with tempfile.TemporaryDirectory(prefix="package libraries ", dir=base) as tmp:
++        root = Path(tmp).absolute()
++        package = root / "pkg"
++        package.mkdir()
++        (package / "mock.goose").write_text('namespace mock;\nextern "fixture" { fn answer() -> i64; }\n')
++        source = root / "main.goose"
++        source.write_text('import mock from "./pkg";\nfn main() { print(mock::answer()); }\n')
++        output = root / "main.c"
++        sidecar = package / "mock.build"
++        arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
++        other = "x86_64" if arch == "arm64" else "arm64"
++        config = ('dylibs = ["fixture=./fallback.so"];\n'
++                  'dylibs_linux = ["fixture=./linux.so"];\n'
++                  f'dylibs_linux_{arch} = ["fixture=./arch.so"];\n'
++                  f'dylibs_linux_{other} = ["fixture=./other.so"];\n')
++        sidecar.write_text(config)
++
++        def compile():
++            return subprocess.run([str(exe), "-q", "-o", str(output), str(source)],
++                                  capture_output=True, text=True, timeout=60)
++
++        result = compile()
++        if result.returncode:
++            raise RuntimeError(result.stdout + result.stderr)
++        generated = output.read_text()
++        for filename in ("fallback.so", "arch.so"):
++            match = re.search(r'"([^"\n]*/pkg/' + re.escape(filename) + r')"', generated)
++            assert match and Path(match[1]).is_absolute(), filename
++            assert Path(match[1]).resolve() == (package / filename).resolve()
++        assert "/pkg/linux.so" not in generated and "/pkg/other.so" not in generated
++
++        # The root's mapping wins; ./ still means the program's resources.
++        (root / "main.build").write_text('dylibs_linux = ["fixture=./program.so"];\n')
++        result = compile()
++        if result.returncode:
++            raise RuntimeError(result.stdout + result.stderr)
++        generated = output.read_text()
++        assert '"./program.so"' in generated and "/pkg/arch.so" not in generated
++        (root / "main.build").unlink()
++
++        # Both paths use the same validation, with unchanged diagnostics.
++        for key, entries, diagnostic in (
++            ("dylibs", '["fixture"]', "is written name=spelling"),
++            (f"dylibs_linux_{arch}", '["fixture="]', "is written name=spelling"),
++            ("dylibs_linux", '["fixture=a", "fixture=b"]', "maps fixture twice"),
++        ):
++            sidecar.write_text(f"{key} = {entries};\n")
++            result = compile()
++            assert result.returncode != 0 and diagnostic in result.stderr, result.stdout + result.stderr
++
++
++if __name__ == "__main__":
++    compiler = Path(sys.argv[1]).resolve()
++    if not compiler.exists():
++        compiler = compiler.with_suffix(".exe")
++    check_package_dylibs(compiler)
++    print("package dylibs: relative paths, overrides and validation passed")
+diff --git a/test/run_tests.py b/test/run_tests.py
+index dee6a70d..4bd54939 100755
+--- a/test/run_tests.py
++++ b/test/run_tests.py
+@@ -2311,6 +2311,15 @@ def main():
+     if jit:
+         r.show_task(native_reentry)
+ 
++    def package_library_mappings():
++        from package_dylibs import check_package_dylibs
++        try:
++            check_package_dylibs(exe, gendir)
++            r.ok("package libraries: relative paths, overrides and validation")
++        except (AssertionError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
++            r.fail("package libraries", str(e))
++    r.show_task(package_library_mappings)
++
+     r.section("native builds, packages and runtime I/O")
+ 
+     def extern_types():

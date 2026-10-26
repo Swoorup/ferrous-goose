@@ -9,19 +9,23 @@ The six patches now apply to upstream `master` commit
 [`a108677d300cb0e8bbb842c35a353abe67a20c6c`](https://github.com/aardappel/goose/commit/a108677d300cb0e8bbb842c35a353abe67a20c6c),
 17 commits after the previous pin. Stock and patched compilers were rebuilt
 on macOS arm64. The update preserves upstream's formatter, help/completion,
-version reporting and runtime additions.
+version reporting and runtime additions. The subsequent cleanup fixes
+callback eligibility for mutually recursive exports and removes unused
+registration and normal-return hook calls from plain Goose programs.
 
 | Check | Result |
 |---|---|
 | Each patch stage | All six pass C++ syntax checks and embedded runtime-header regeneration checks |
-| Upstream compiler baseline | 4,802 checks passed with native Clang and TinyCC; optional graphics/audio/physics/UI cases were skipped |
+| Upstream compiler baseline | 4,805 checks passed with native Clang and TinyCC; optional graphics/audio/physics/UI cases were skipped |
 | Workspace tests | Passed, including old/new compiler version parsing, strict borrowing/allocation tests and mandatory layout verification |
-| Goose calling Rust | Stock: 23 passed, 8 skipped for unavailable features; patched: 31 passed |
+| Goose calling Rust | Stock: 23 passed, 10 skipped for unavailable features; patched: 33 passed |
 | Rust calling Goose | Stock: 14 basic checks; patched: 24 full checks |
 | Plain C native provider | JIT/native builds, runtime hooks, typed builders and rejection cases passed |
 | Rust native provider | One-crate and combined two-crate programs passed under `goose run` and `goose build` |
+| Compiler patch regressions | Recursive callback rejection and safe recursion at `-O0`/`-O2`, shutdown hooks, nested JSON layouts/escaping, and package mapping precedence/validation passed |
 | New upstream tooling | Formatter cases, source dumps retaining `reentrant`/`align`, JSON stdout and quiet interface-file output passed |
-| Ordinary Goose code generation | Identical stock/patched caller and callee bodies at `-O0`; identical inlined caller bodies at `-O2` for the typed-builder example |
+| Public interface compatibility | Basic/full embedding fixtures produce byte-identical interface JSON and unchanged C declarations apart from parameter names |
+| Ordinary Goose code generation | Caller/callee, initialization and `main` bodies match stock at `-O0`; inlined caller, initialization and `main` bodies match at `-O2` |
 
 The local bridge checks used
 `CARGO_TERM_COLOR=always SKIP_PACKAGES=1 scripts/check.sh`; the compiler
@@ -38,15 +42,18 @@ The CLI also continues to recognize the previously validated stock runtime
 The earlier consolidation from eight patches to six preserved compiler
 behavior at the old pin. Its nine documentation examples passed locally:
 five Goose callers, two Rust hosts, a native provider and a prebuilt package
-without Rust on PATH. The upstream update also fixes source-dump and quiet
-output integration. It does not add conditional runtime-hook emission;
-unused startup/shutdown machinery is described in the performance guide.
+without Rust on PATH. The callback regression was first reproduced against
+the old analysis.
+The new check rejects both declaration orders of an unsafe recursive cycle
+and permits safe self/mutual recursion. CI runs the compiler patch
+regression modules on all three platforms, alongside Rust conformance.
+Remaining shared-runtime costs are described in the performance guide.
 
-Before these changes, [CI run 40214715127](https://github.com/Swoorup/ferrous-goose/actions/runs/40214715127)
-at `044c7a95` passed all seven jobs: Linux, macOS and Windows tests, the
-cross-platform package build, and no-Rust package checks on all three
-platforms. That completed run covers the old upstream pin; current update
-results are reported by the Actions workflow linked above.
+Before this cleanup, [CI run 40340706924](https://github.com/Swoorup/ferrous-goose/actions/runs/40340706924)
+at `d3aba357` passed all seven jobs on the current upstream pin: Linux,
+macOS and Windows tests, the cross-platform package build, and no-Rust
+package checks. It predates the recursive-callback fix and its new tests;
+current results are reported by the Actions workflow linked above.
 
 Strict exports support host-target packaging only. Foreign targets are
 rejected before building because host metadata cannot verify their layouts.
@@ -71,9 +78,9 @@ rejected before building because host metadata cannot verify their layouts.
 
 | Platform | Recorded coverage |
 |---|---|
-| macOS arm64 | Latest upstream pin passes the local checks above; the previous pin also passed CI and no-Rust package examples. |
-| Linux x86_64 | Previous series passed full CI tests, examples and no-Rust package checks at `044c7a95`. |
-| Windows x86_64 | Previous series passed full CI tests, JIT/native examples and no-Rust package checks at `044c7a95`. |
+| macOS arm64 | Latest local checks pass; the current pin passed CI and no-Rust package examples at `d3aba357`, before this cleanup. |
+| Linux x86_64 | Current upstream pin passed CI tests, examples and no-Rust package checks at `d3aba357`, before this cleanup. |
+| Windows x86_64 | Current upstream pin passed CI tests, JIT/native examples and no-Rust package checks at `d3aba357`, before this cleanup. |
 | Linux arm64, Ubuntu 24.04 | Earlier compiler builds, conformance, examples and package examples passed. |
 | macOS x86_64 | Universal package libraries contain this architecture; no execution results recorded. |
 | CI | The [workflow](../.github/workflows/ci.yml) builds the pinned stock/patched compilers on all three runner platforms, packages the libraries, and runs their examples without Rust. |

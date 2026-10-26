@@ -1,6 +1,6 @@
-From f3777dd54c5a3af35d490e130321f20074ede67f Mon Sep 17 00:00:00 2001
+From e5843d0c7053575bc47c96b7b37b7088a3da80a7 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 01:03:05 +1100
+Date: Tue, 27 Oct 2026 02:27:46 +1100
 Subject: [PATCH] Build native libraries through external providers
 
 Accept a versioned library report from an external build command, with
@@ -140,7 +140,7 @@ index 8f27d976..6210947f 100644
 -#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks reentrant"
 +#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build reentrant"
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 9c09add8..1fa1b2a9 100644
+index 880d22ae..e5f3c29d 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
 @@ -899,6 +899,20 @@ inline void CodeGen::EmitProgramInit() {
@@ -161,9 +161,9 @@ index 9c09add8..1fa1b2a9 100644
 +        Append(data, "void ", hook, "(const gs_rt_hooks *);\n");
 +        Append(code, "    gs_rt_give_hooks(", hook, ");\n");
 +    }
-     Append(data, "static void gs_register_reentry(void);\n");
-     Append(code, "    gs_register_reentry();\n");
-     // The queues, before anything that could use one runs.
+     if (!exports.empty()) {
+         Append(data, "static void gs_register_reentry(void);\n");
+         Append(code, "    gs_register_reentry();\n");
 diff --git a/src/main.cpp b/src/main.cpp
 index 47be09ca..bc7130ed 100644
 --- a/src/main.cpp

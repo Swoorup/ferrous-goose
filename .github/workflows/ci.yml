@@ -44,6 +44,13 @@ jobs:
           scripts/toolchain.sh --stock
           scripts/toolchain.sh
           .toolchain/goose/build/goose version
+      - name: Compiler patch regressions
+        run: |
+          python_bin=python3
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then python_bin=python; fi
+          for test in interface_json native_reentry package_dylibs; do
+            "$python_bin" ".toolchain/goose/test/$test.py" .toolchain/goose/build/goose
+          done
       - name: Rust tests
         run: cargo test --workspace
       - name: Conformance, Goose using Rust (stock)

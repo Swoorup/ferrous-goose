@@ -1,6 +1,6 @@
-From bd65764880a614ca37f5c5671d902d7f62ef28e4 Mon Sep 17 00:00:00 2001
+From f47c166bbfd682f0f88f33648864979be16a032a Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 01:02:49 +1100
+Date: Tue, 27 Oct 2026 02:27:46 +1100
 Subject: [PATCH] Provide runtime hooks and reentrant native callbacks
 
 Provide native libraries with versioned abort, shutdown and callback hooks.
@@ -11,8 +11,8 @@ that do not access mutable globals.
  docs/goose_spec.md         |  23 +++++
  src/ast.h                  |   6 ++
  src/capabilities.h         |   2 +-
- src/codegen.h              |   1 +
- src/codegen_emit.h         |  71 ++++++++++++-
+ src/codegen.h              |  12 ++-
+ src/codegen_emit.h         |  62 ++++++++++-
  src/dump.h                 |   1 +
  src/native.h               |   1 +
  src/parser.h               |   8 +-
@@ -22,8 +22,10 @@ that do not access mutable globals.
  src/runtime/runtime_os.h   |   3 +
  src/runtime_inline.h       | 205 ++++++++++++++++++++++++++++---------
  test/format.py             |   3 +
- test/run_tests.py          |   8 ++
- 15 files changed, 391 insertions(+), 56 deletions(-)
+ test/native_reentry.py     |  82 +++++++++++++++
+ test/run_tests.py          |  18 ++++
+ 16 files changed, 482 insertions(+), 59 deletions(-)
+ create mode 100644 test/native_reentry.py
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
 index c3ee3240..114bb8bd 100644
@@ -87,76 +89,85 @@ index af25e01f..8f27d976 100644
 -#define GOOSE_FEATURES "typed-builders export-results emit-interface"
 +#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks reentrant"
 diff --git a/src/codegen.h b/src/codegen.h
-index 26dd84eb..14d7aeba 100644
+index e76cae21..75ee2434 100644
 --- a/src/codegen.h
 +++ b/src/codegen.h
-@@ -1420,6 +1420,7 @@ struct CodeGen {
-     void EmitProgramInit();
-     void EmitExports();
-     int64_t ExportScratchStacks();
+@@ -1424,8 +1424,9 @@ struct CodeGen {
+     void CollectExports();
+     void EmitExportBuilder(TypeExpr *type, const string &arg, int64_t slot,
+                            vector<string> &params, string &before, string &after);
 +    void EmitReentryTable();
      string MainCall();
-     void EmitMain();
+-    void EmitMain();
++    void EmitMain(bool end_hooks);
  
+     // ------------------------------------------------------------------
+     // Driver.
+@@ -1467,7 +1468,14 @@ struct CodeGen {
+         CollectExports();
+         EmitProgramInit();
+         EmitExports();
+-        if (!library) EmitMain();
++        if (!library) {
++            // Native code or a user header can register shutdown hooks. Keep
++            // the call conservatively for those programs, including unused
++            // native objects with initializers; plain Goose needs none.
++            auto end_hooks = !usedexterns.empty() || !headers.empty() ||
++                any_of(ast.packages.begin(), ast.packages.end(), [](const Package &p) { return p.HasNative(); });
++            EmitMain(end_hooks);
++        }
+         if (usesthreads) predefs = "#define GS_NEED_THREADS 1\n";
+         // The instance block: with workers each thread reaches its own
+         // through gs_gl; without them there is only main's.
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index c046754f..9c09add8 100644
+index 2e50d10e..880d22ae 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
-@@ -899,6 +899,8 @@ inline void CodeGen::EmitProgramInit() {
+@@ -899,6 +899,10 @@ inline void CodeGen::EmitProgramInit() {
      if (!dllibs.empty())
          Append(code, "    gs_dl_bind(gs_dllibs, ", dllibs.size(), ", gs_dlbinds, ", dlbinds,
                 ");\n");
-+    Append(data, "static void gs_register_reentry(void);\n");
-+    Append(code, "    gs_register_reentry();\n");
++    if (!exports.empty()) {
++        Append(data, "static void gs_register_reentry(void);\n");
++        Append(code, "    gs_register_reentry();\n");
++    }
      // The queues, before anything that could use one runs.
      vector<string> qnames;
      for (auto &[m, q] : queues) qnames.push_back(q);
-@@ -1061,6 +1063,73 @@ inline void CodeGen::EmitExports() {
+@@ -1064,6 +1068,58 @@ inline void CodeGen::EmitExports() {
          }
          Append(code, "}\n\n");
      }
 +    EmitReentryTable();
 +}
 +
-+// The table a call back from C finds export fns in:
-+// each one's C symbol, its signature as Goose writes it, its wrapper, and
-+// whether a call back may reach it: one that touches no `var` global, so
-+// that the code it interrupts, which assumed an extern leaves the globals
-+// alone (§7.10), and which may hold references into them, stays right.
-+// Whether the specialization, or anything it calls, names a `var` global.
-+// `memo` holds the answers so far; a specialization being walked counts as
-+// not touching one, which its other paths settle.
-+static bool TouchesVarGlobal(FnSpec *sp, map<FnSpec *, bool> &memo) {
-+    if (!sp) return false;
-+    auto it = memo.find(sp);
-+    if (it != memo.end()) return it->second;
-+    memo[sp] = false;
++// Check each exported entry independently. A visited edge stops recursion,
++// but cannot establish that another entry in that cycle is free of globals.
++static bool TouchesVarGlobal(FnSpec *sp, set<FnSpec *> &visited) {
++    if (!sp || !visited.insert(sp).second) return false;
 +    auto found = false;
 +    function<void(Node *)> walk = [&](Node *n) {
 +        if (!n || found) return;
 +        if (auto id = Is<Ident>(n))
 +            if (id->vdef && id->vdef->isglobal && id->vdef->isvar) found = true;
 +        if (auto c = Is<Call>(n)) {
-+            if (c->builtin < 0 && TouchesVarGlobal(c->spec, memo)) found = true;
++            if (c->builtin < 0 && TouchesVarGlobal(c->spec, visited)) found = true;
 +            for (auto d : c->dispatch)
-+                if (TouchesVarGlobal(d, memo)) found = true;
++                if (TouchesVarGlobal(d, visited)) found = true;
 +            for (auto &fs : c->fmtspecs)
-+                if (TouchesVarGlobal(fs.second, memo)) found = true;
++                if (TouchesVarGlobal(fs.second, visited)) found = true;
 +        }
 +        RunChildren(n, walk);
 +    };
 +    walk(sp->body);
-+    memo[sp] = found;
 +    return found;
 +}
 +
 +inline void CodeGen::EmitReentryTable() {
++    if (exports.empty()) return;
 +    string rows;
-+    int64_t n = 0;
-+    map<FnSpec *, bool> touched;
-+    for (auto sf : ast.functions) {
-+        if (!sf->isexport || sf->specs.size() != 1 || !sinfo.count(sf->specs[0])) continue;
-+        auto sp = sf->specs[0];
++    for (auto sp : exports) {
++        auto sf = sp->sf;
 +        string sig;
 +        for (size_t i = 0; i < sp->argtypes.size(); i++) {
 +            string t;
@@ -169,28 +180,30 @@ index c046754f..9c09add8 100644
 +            sp->rets[i]->Dump(t);
 +            Append(sig, i ? "," : "", t);
 +        }
-+        auto safe = !TouchesVarGlobal(sp, touched);
++        set<FnSpec *> visited;
++        auto safe = !TouchesVarGlobal(sp, visited);
 +        // Type text holds no quote or backslash to escape.
 +        auto esc = cat("\"", sig, "\"");
 +        Append(rows, "    { \"", sf->cname, "\", ", esc, ", (void (*)(void))", sf->cname, ", ", safe ? 1 : 0,
 +               " },\n");
-+        n++;
 +    }
-+    if (n)
-+        Append(code, "static const gs_reentry_entry gs_reentry_table[] = {\n", rows, "};\n"
-+                     "static void gs_register_reentry(void) { gs_rt_set_reentry(gs_reentry_table, ", n,
-+               "); }\n\n");
-+    else
-+        Append(code, "static void gs_register_reentry(void) {}\n\n");
++    Append(code, "static const gs_reentry_entry gs_reentry_table[] = {\n", rows, "};\n"
++                 "static void gs_register_reentry(void) { gs_rt_set_reentry(gs_reentry_table, ", exports.size(),
++           "); }\n\n");
  }
  
  inline string CodeGen::ExportHeader() {
-@@ -1078,7 +1147,7 @@ inline string CodeGen::ExportHeader() {
+@@ -1079,9 +1135,11 @@ inline string CodeGen::ExportHeader() {
+     return header;
+ }
  
- inline void CodeGen::EmitMain() {
+-inline void CodeGen::EmitMain() {
++inline void CodeGen::EmitMain(bool end_hooks) {
      Append(code, "int main(int argc, char **argv) {\n    gs_program_init(argc, argv);\n",
 -           MainCall(), "    gs_rt_stats();\n    return 0;\n}\n");
-+           MainCall(), "    gs_rt_stats();\n    gs_rt_end_hooks();\n    return 0;\n}\n");
++           MainCall(), "    gs_rt_stats();\n");
++    if (end_hooks) code += "    gs_rt_end_hooks();\n";
++    code += "    return 0;\n}\n";
  }
  
  }  // namespace goose
@@ -948,8 +961,96 @@ index 78305db1..46116e78 100644
      ("spacing",
       "fn  f(a:i64,b :i64)->i64{a+b}\n",
       "fn f(a: i64, b: i64) -> i64 { a + b }\n"),
+diff --git a/test/native_reentry.py b/test/native_reentry.py
+new file mode 100644
+index 00000000..e2faf0a9
+--- /dev/null
++++ b/test/native_reentry.py
+@@ -0,0 +1,82 @@
++"""Exercise callback eligibility through the public C hooks, including cycles."""
++from pathlib import Path
++import re
++import subprocess
++import sys
++import tempfile
++
++HEADER = '''static const gs_rt_hooks *test_hooks;
++static void test_end(void) { puts("shutdown"); }
++static void test_capture(const gs_rt_hooks *hooks) {
++    test_hooks = hooks;
++    hooks->at_end(test_end);
++}
++int64_t test_invoke(int64_t n) {
++    gs_rt_give_hooks(test_capture);
++    const char *why = NULL;
++    int64_t (*callback)(int64_t) = (int64_t (*)(int64_t))
++        test_hooks->reentry_lookup("target", "i64->i64", &why);
++    return callback ? callback(n) : -999;
++}
++'''
++FIRST = '''export recursive fn first(n: i64) -> i64 {
++    if n > 0 { target(n - 1); }
++    shared += 1;
++    return shared;
++}
++'''
++TARGET = '''export recursive fn target(n: i64) -> i64 {
++    if n > 0 { return first(n - 1); }
++    return 0;
++}
++'''
++SAFE = '''export recursive fn first(n: i64) -> i64 {
++    if n > 0 { return target(n - 1) + 1; }
++    return 0;
++}
++export recursive fn target(n: i64) -> i64 {
++    if n > 0 { return first(n - 1) + 1; }
++    return 0;
++}
++'''
++
++
++def check_native_reentry(exe, base=None):
++    with tempfile.TemporaryDirectory(prefix="native reentry ", dir=base) as tmp:
++        root = Path(tmp)
++        header = root / "callbacks.h"
++        header.write_text(HEADER)
++        cases = [
++            ("unsafe-forward", "var shared: i64 = 0;\n" + FIRST + TARGET, -999, "assert(shared == 0);"),
++            ("unsafe-reverse", "var shared: i64 = 0;\n" + TARGET + FIRST, -999, "assert(shared == 0);"),
++            ("safe-mutual", SAFE, 4, ""),
++            ("safe-self", "export recursive fn target(n: i64) -> i64 { if n > 0 { return target(n - 1) + 1; } return 0; }\n", 4, ""),
++            ("missing", "", -999, ""),
++        ]
++        for opt in ("-O0", "-O2"):
++            for name, exports, expected, extra in cases:
++                source = root / (name + ".goose")
++                source.write_text(exports + 'extern reentrant fn invoke(n: i64) -> i64 = "test_invoke";\n'
++                                  + f'fn main() {{ assert(invoke(4) == {expected}); {extra} print("ok"); }}\n')
++                result = subprocess.run([str(exe), "run", opt, "-q", "--include", str(header), str(source)],
++                                        capture_output=True, text=True, timeout=60)
++                if result.returncode or result.stdout != "ok\nshutdown\n":
++                    raise RuntimeError(f"{name} {opt}: {result.stdout}{result.stderr}")
++            plain = root / "plain.goose"
++            plain.write_text('fn main() { var xs: i64[>..] = []; for i in 4 { xs.push(i * i); } print(xs); }\n')
++            output = root / "plain.c"
++            result = subprocess.run([str(exe), opt, "-q", "-o", str(output), str(plain)],
++                                    capture_output=True, text=True, timeout=60)
++            if result.returncode:
++                raise RuntimeError(result.stdout + result.stderr)
++            generated = output.read_text()
++            assert not re.search(r"\bgs_register_reentry\s*\(", generated)
++            assert "gs_rt_end_hooks();" not in generated
++
++
++if __name__ == "__main__":
++    compiler = Path(sys.argv[1]).resolve()
++    if not compiler.exists():
++        compiler = compiler.with_suffix(".exe")
++    check_native_reentry(compiler)
++    print("native reentry: unsafe cycles rejected, safe recursion and shutdown hooks preserved")
 diff --git a/test/run_tests.py b/test/run_tests.py
-index d587a6ec..09db60d9 100755
+index 165a6194..dee6a70d 100755
 --- a/test/run_tests.py
 +++ b/test/run_tests.py
 @@ -2093,6 +2093,14 @@ def main():
@@ -967,3 +1068,20 @@ index d587a6ec..09db60d9 100755
          # Less than a page or two of data stack is no reservation to run on.
          code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
          checks.append(("check --stack-reserve 5000 (refused)",
+@@ -2293,6 +2301,16 @@ def main():
+             r.fail("native interface JSON", str(e))
+     r.show_task(native_interface_json)
+ 
++    def native_reentry():
++        from native_reentry import check_native_reentry
++        try:
++            check_native_reentry(exe, gendir)
++            r.ok("native reentry: recursive eligibility, shutdown and unused setup")
++        except (AssertionError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
++            r.fail("native reentry", str(e))
++    if jit:
++        r.show_task(native_reentry)
++
+     r.section("native builds, packages and runtime I/O")
+ 
+     def extern_types():

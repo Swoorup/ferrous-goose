@@ -1,6 +1,6 @@
-From 71a121622ba1619125f3d19cafb2c3e5de75ae35 Mon Sep 17 00:00:00 2001
+From be0d4c432e044f550c6095d2f768f77887f78cd0 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 01:01:31 +1100
+Date: Tue, 27 Oct 2026 02:21:49 +1100
 Subject: [PATCH] Support typed builders and multiple results across the native
  interface
 
@@ -11,16 +11,16 @@ Report the native value ABI and independently named capabilities.
 ---
  docs/goose_spec.md        |  27 +++++--
  src/capabilities.h        |   5 ++
- src/codegen.h             |   1 +
- src/codegen_emit.h        | 144 +++++++++++++++++++++++++++++++-------
+ src/codegen.h             |   6 ++
+ src/codegen_emit.h        | 149 +++++++++++++++++++++++++++++++-------
  src/main.cpp              |   2 +
  src/runtime/goose.h       |  14 +++-
  src/runtime/runtime_ext.h |   9 +++
- src/runtime_inline.h      |  29 ++++++--
+ src/runtime_inline.h      |  29 +++++++-
  src/typecheck.h           |   6 +-
  src/typecheck_calls.h     |  22 ++++--
  test/run_tests.py         |   4 +-
- 11 files changed, 218 insertions(+), 45 deletions(-)
+ 11 files changed, 227 insertions(+), 46 deletions(-)
  create mode 100644 src/capabilities.h
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
@@ -85,19 +85,31 @@ index 00000000..0e629230
 +#define GOOSE_NATIVE_ABI 1
 +#define GOOSE_FEATURES "typed-builders export-results"
 diff --git a/src/codegen.h b/src/codegen.h
-index 14dd29d0..26dd84eb 100644
+index 14dd29d0..e76cae21 100644
 --- a/src/codegen.h
 +++ b/src/codegen.h
-@@ -1419,6 +1419,7 @@ struct CodeGen {
+@@ -1419,6 +1419,11 @@ struct CodeGen {
      void InitGlobalStack(VarDef *d);
      void EmitProgramInit();
      void EmitExports();
-+    int64_t ExportScratchStacks();
++    vector<FnSpec *> exports;
++    int64_t export_scratch_stacks = 0;
++    void CollectExports();
++    void EmitExportBuilder(TypeExpr *type, const string &arg, int64_t slot,
++                           vector<string> &params, string &before, string &after);
      string MainCall();
      void EmitMain();
  
+@@ -1459,6 +1464,7 @@ struct CodeGen {
+         for (size_t i = 0; i < erqueue.size(); i++) EmitSpec(erqueue[i], true);
+         // The render functions any of those asked for (may ask for more).
+         for (size_t i = 0; i < renderqueue.size(); i++) EmitRenderFn(renderqueue[i]);
++        CollectExports();
+         EmitProgramInit();
+         EmitExports();
+         if (!library) EmitMain();
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 70c5027b..c046754f 100644
+index 70c5027b..2e50d10e 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
 @@ -887,8 +887,8 @@ inline void CodeGen::EmitProgramInit() {
@@ -107,32 +119,55 @@ index 70c5027b..c046754f 100644
 -                 "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
 -           ", ", workerregions, ");\n");
 +                 "    gs_rt_init(argc, argv, ", mainstacks, ", ",
-+           mainstacks + globalregions + ExportScratchStacks(), ", ", workerregions, ");\n");
++           mainstacks + globalregions + export_scratch_stacks, ", ", workerregions, ");\n");
      // The shared libraries' functions, before a global's initializer could
      // call one: on the main thread, before any worker exists, so the
      // pointers are written once here and read thereafter without
-@@ -923,45 +923,141 @@ inline string CodeGen::MainCall() {
+@@ -923,45 +923,144 @@ inline string CodeGen::MainCall() {
      return cat("    ", mi.cname, "(", mi.needssp ? "0" : "", ");\n");
  }
  
+-inline void CodeGen::EmitExports() {
 +// Whether an export's parameter is a builder (T[>..]&), which the C
 +// wrapper replaces with the runtime's scratch builder for the call.
 +static inline bool IsExportBuilder(TypeExpr *t) {
 +    return t->kind == TY_REF && t->ref->sub->kind == TY_ARRAY && t->ref->sub->arr->akind == A_GROW;
 +}
 +
-+// The scratch builders exports need: one data stack per builder parameter
-+// of the export with the most, each holding one call's elements until the
-+// next exported call starts.
-+inline int64_t CodeGen::ExportScratchStacks() {
-+    int64_t most = 0;
-+    for (auto sf : ast.functions) {
-+        if (!sf->isexport || sf->specs.size() != 1) continue;
++// Resolve the public exports once, including the largest simultaneous set
++// of output builders. Each builder gets a scratch stack until the next call.
++inline void CodeGen::CollectExports() {
+     for (auto sf : ast.functions) {
+         if (!sf->isexport) continue;
+         if (sf->specs.size() != 1 || !sinfo.count(sf->specs[0]))
+             Fail(sf->line, cat("export fn ", sf->name, " has no emitted specialization"));
+         auto sp = sf->specs[0];
++        exports.push_back(sp);
 +        int64_t n = 0;
-+        for (auto t : sf->specs[0]->argtypes) n += IsExportBuilder(t);
-+        most = std::max(most, n);
++        for (auto t : sp->argtypes) n += IsExportBuilder(t);
++        export_scratch_stacks = std::max(export_scratch_stacks, n);
 +    }
-+    return most;
++}
++
++// A public builder parameter returns the elements and count written to the
++// runtime's scratch storage; the internal Goose call receives its gs_rref.
++inline void CodeGen::EmitExportBuilder(TypeExpr *type, const string &arg, int64_t slot,
++                                       vector<string> &params, string &before, string &after) {
++    auto elem = type->ref->sub->arr->sub;
++    auto et = IsU8(elem) ? string("uint8_t") : CT(elem);
++    auto hdr = Unique(cat("gs_export_hdr", slot));
++    auto lenp = Unique(cat("gs_export_len", slot));
++    params.push_back(cat("const ", et, " **", arg, "_data, int64_t *", lenp));
++    Append(before,
++           "    if (!gs_export_scratch_base[", slot, "]) {\n"
++           "        gs_stack_init(&gs_export_scratch[", slot, "]);\n"
++           "        gs_export_scratch_base[", slot, "] = gs_export_scratch[", slot, "].top;\n"
++           "    }\n"
++           "    gs_export_scratch[", slot, "].top = gs_export_scratch_base[", slot, "];\n"
++           "    gs_rhdr ", hdr, " = { gs_export_scratch_base[", slot, "], 0 };\n"
++           "    gs_rref ", arg, " = { &", hdr, ", &gs_export_scratch[", slot, "] };\n");
++    Append(after, "    if (", arg, "_data) *", arg, "_data = (const ", et, " *)", hdr,
++           ".base;\n    if (", lenp, ") *", lenp, " = ", hdr, ".len;\n");
 +}
 +
 +// The C wrapper of each export fn (§7.11): its parameters in their C
@@ -141,23 +176,19 @@ index 70c5027b..c046754f 100644
 +// exported call), the first result as the C return value (a `const u8[:]`
 +// as a pointer and a trailing `int64_t *` length) and every further result
 +// through a trailing out-pointer.
- inline void CodeGen::EmitExports() {
-+    auto scratch = ExportScratchStacks();
++inline void CodeGen::EmitExports() {
++    auto scratch = export_scratch_stacks;
 +    if (scratch)
 +        Append(code, "static gs_stack gs_export_scratch[", scratch, "];\n"
 +                     "static uint8_t *gs_export_scratch_base[", scratch, "];\n\n");
-     for (auto sf : ast.functions) {
-         if (!sf->isexport) continue;
-         if (sf->specs.size() != 1 || !sinfo.count(sf->specs[0]))
-             Fail(sf->line, cat("export fn ", sf->name, " has no emitted specialization"));
-         auto sp = sf->specs[0];
++    for (auto sp : exports) {
++        auto sf = sp->sf;
          auto &si = sinfo[sp];
 -        auto returnslice = !sp->rets.empty() && sp->rets[0]->kind == TY_SLICE;
 -        string params, args;
 -        vector<string> argv;
 +        string body, after;
 +        vector<string> argv, pparams, rparams;
-+        auto addp = [&](const string &p) { pparams.push_back(p); };
 +        int64_t k = 0;
          for (size_t i = 0; i < sp->argtypes.size(); i++) {
 +            auto t = sp->argtypes[i];
@@ -165,24 +196,9 @@ index 70c5027b..c046754f 100644
 -            Append(params, params.empty() ? "" : ", ", CT(sp->argtypes[i]), " ", arg);
 -            PushArg(argv, sp->argtypes[i], IsPoolParam(sp, i), arg);
 +            if (IsExportBuilder(t)) {
-+                auto elem = t->ref->sub->arr->sub;
-+                auto et = IsU8(elem) ? string("uint8_t") : CT(elem);
-+                auto hdr = Unique(cat("gs_export_hdr", i));
-+                auto lenp = Unique(cat("gs_export_len", i));
-+                addp(cat("const ", et, " **", arg, "_data, int64_t *", lenp));
-+                Append(body,
-+                       "    if (!gs_export_scratch_base[", k, "]) {\n"
-+                       "        gs_stack_init(&gs_export_scratch[", k, "]);\n"
-+                       "        gs_export_scratch_base[", k, "] = gs_export_scratch[", k, "].top;\n"
-+                       "    }\n"
-+                       "    gs_export_scratch[", k, "].top = gs_export_scratch_base[", k, "];\n"
-+                       "    gs_rhdr ", hdr, " = { gs_export_scratch_base[", k, "], 0 };\n"
-+                       "    gs_rref ", arg, " = { &", hdr, ", &gs_export_scratch[", k, "] };\n");
-+                Append(after, "    if (", arg, "_data) *", arg, "_data = (const ", et, " *)", hdr,
-+                       ".base;\n    if (", lenp, ") *", lenp, " = ", hdr, ".len;\n");
-+                k++;
++                EmitExportBuilder(t, arg, k++, pparams, body, after);
 +            } else {
-+                addp(cat(CT(t), " ", arg));
++                pparams.push_back(cat(CT(t), " ", arg));
 +            }
 +            PushArg(argv, t, IsPoolParam(sp, i), arg);
 +        }

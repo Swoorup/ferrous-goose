@@ -1,0 +1,2 @@
+export fn tally uses a var global, so it cannot be called back during a call into C
+count untouched: 0

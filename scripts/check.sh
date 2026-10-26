@@ -18,6 +18,11 @@ cargo build -q --release -p cargo-goose
 cg="$root/target/release/cargo-goose"
 export PATH="$root/target/release:$PATH"
 
+step "Compiler patch regressions"
+for test in interface_json native_reentry package_dylibs; do
+    python3 "$root/.toolchain/goose/test/$test.py" "$patched"
+done
+
 step "C native provider (patched)"
 python3 scripts/check-native-build.py "$patched"
 

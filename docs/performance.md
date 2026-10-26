@@ -121,11 +121,11 @@ in place.
 | Typed builders | Element stores and stack/length updates; data-stack pages may need commitment | Ordinary Goose builder calls use their existing implementation |
 | Export results | Output-pointer writes; first-use scratch-stack initialization and resets for exported builders | No export scratch stacks without exported builder parameters |
 | Interface metadata | Compiler layout analysis and JSON output | No JSON output or runtime reflection |
-| Runtime hooks | Library hook discovery and initialization; registered shutdown callbacks | The current compiler still emits a shutdown-hook call; loading any external library probes for the optional hook symbol |
+| Runtime hooks | Library hook discovery and initialization; registered shutdown callbacks | Normal-return handling is omitted without extern calls, custom C headers or native packages; shared runtime exit/abort paths still check hooks |
 | Native providers | External builds, combination, linking and caching; optional startup initializer | No provider runs without configuration; no added provider dispatch on ordinary calls |
 | Package libraries | Compile-time path resolution and startup loading/symbol resolution | No per-call package lookup |
 | Alignment | Alignment attributes, stack-top rounding and possibly larger enum layouts | Unannotated types keep their default layouts |
-| Re-entry | Stack publication in affected callers, callback checks and cached successful lookups | Registration scaffolding is still emitted; programs with exports get a callback table even without reentrant calls |
+| Re-entry | Stack publication in affected callers, callback checks and cached successful lookups | No callback registration without exports; programs with exports retain a lookup table even without reentrant calls |
 
 `native::fill_squares(4, values)` can name an ordinary Goose function. The
 namespace does not imply a foreign call; `extern` establishes that boundary.
@@ -133,15 +133,20 @@ With upstream pin `a108677d`, the all-Goose typed-builder example emitted
 identical stock/patched caller and callee bodies at `-O0`, and identical
 inlined caller bodies at `-O2`.
 
-The complete generated programs differed: the patched version contained
-an empty `gs_register_reentry()` call and `gs_rt_end_hooks()` at shutdown,
-plus additional runtime declarations/helpers. Clang `-O2` eliminated the
-empty registration in the separate-runtime build; the shutdown call
-remained. Other backends and optimization settings may retain different
-amounts of this code. This was a generated-code comparison, not a latency,
-compiler-speed or whole-program binary-size benchmark.
+The generated initialization and `main` bodies now also match stock for
+that example. There is no empty callback-registration function or call, and
+no normal-return shutdown-hook call. This is a code-generation property at
+both inlining levels, without relying on the C optimizer.
 
-The series therefore does not promise zero overhead for unused native
-features. Conditional emission of unused hook and callback machinery is
-future work. The [patch guide](goose-patches.md) shows both language sides,
-stock alternatives, lifetime rules and the affected code-generation paths.
+These checks do not establish identical binary size or zero cost on every
+path. Programs with exports retain callback metadata. Extern calls, custom
+C headers or native packages conservatively keep normal-return shutdown
+handling, even when no callbacks are registered. Runtime declarations and
+helpers remain, and explicit exit/abort paths in the shared runtime still
+check shutdown hooks. No new latency, compiler-speed or whole-program
+binary-size benchmark was performed.
+
+Callback eligibility uses a fresh traversal for each export, so recursive
+cycles cannot reuse an incomplete safety result. The extra analysis is
+compiler work, not a new per-call runtime check. The [patch guide](goose-patches.md)
+shows both language sides, stock alternatives and lifetime rules.
