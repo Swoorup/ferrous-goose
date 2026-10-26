@@ -1,5 +1,5 @@
 // test: needs align
-// align n (goose-patches/0007): structs declared with Rust's alignment stay
+// align n (goose-patches/0006): structs declared with Rust's alignment stay
 // aligned in Goose, so Rust borrows them in place; a #[goose(align)] enum
 // with data is laid out as Rust's #[repr(C, u8)] and crosses in place too.
 import cf;

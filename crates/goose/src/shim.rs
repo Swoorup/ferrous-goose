@@ -120,20 +120,20 @@ pub fn call<R>(
 // ---- ending the program ----
 
 /// The Goose runtime's own abort, `gs_abort_msg(msg, len, file, line)`,
-/// where the runtime hands it over (goose-patches/0004: a contained worker
+/// where the runtime hands it over (goose-patches/0003: a contained worker
 /// then ends alone, as with any Goose abort).
 type GsAbortMsg = unsafe extern "C" fn(*const u8, i64, *const libc::c_char, libc::c_int) -> !;
 
 static GS_ABORT_MSG: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// The runtime functions a Goose runtime hands a library it loads, as
-/// `goose_runtime_hooks` (goose-patches/0004): `gs_rt_hooks` in `goose.h`.
+/// `goose_runtime_hooks` (goose-patches/0003): `gs_rt_hooks` in `goose.h`.
 #[repr(C)]
 pub struct RuntimeHooks {
     pub version: u32,
     pub abort_msg: Option<GsAbortMsg>,
     pub at_end: Option<unsafe extern "C" fn(extern "C" fn())>,
-    /// Version 2 (goose-patches/0008): an export fn to call back, by name
+    /// Version 2 (goose-patches/0003): an export fn to call back, by name
     /// and signature; and whether this thread runs the main program.
     pub reentry_lookup: Option<
         unsafe extern "C" fn(*const libc::c_char, *const libc::c_char, *mut *const libc::c_char) -> *mut libc::c_void,

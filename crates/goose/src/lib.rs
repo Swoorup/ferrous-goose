@@ -55,7 +55,7 @@ pub use ferrous_goose_macros::handle;
 /// layout: `#[derive(goose::Flat)]`.
 pub use ferrous_goose_macros::Flat;
 /// Declares Goose export fns that Rust calls back while Goose waits on a
-/// call (goose-patches/0008): `goose::callbacks! { fn on_event(x: i64) -> bool; }`
+/// call (goose-patches/0003): `goose::callbacks! { fn on_event(x: i64) -> bool; }`
 /// makes `on_event(&Reentry, i64) -> Result<bool, ReentryError>`.
 pub use ferrous_goose_macros::callbacks;
 
@@ -153,7 +153,7 @@ pub unsafe extern "C" fn goose_leak_report(out: GsRref) -> i64 {
 }
 
 /// The leak report a debug build prints when the program ends, where the
-/// runtime calls back at its end (goose-patches/0004).
+/// runtime calls back at its end (goose-patches/0003).
 #[no_mangle]
 pub extern "C" fn goose_at_end() {
     if cfg!(debug_assertions) || std::env::var_os("GOOSE_RUST_LEAKS").is_some() {

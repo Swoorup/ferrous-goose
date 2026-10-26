@@ -18,7 +18,7 @@
 //! The compiler writes the program's C (`--standalone`, runtime included)
 //! and its interface; the cc crate compiles the C; the interface becomes
 //! `$OUT_DIR/<name>.rs`, which `goose::include!(<name>)` brings in. A
-//! compiler with `--emit-interface` (goose-patches/0003) describes the
+//! compiler with `--emit-interface` (goose-patches/0002) describes the
 //! interface itself, layouts included; without it, the sources are read for
 //! the shapes a stock export takes.
 

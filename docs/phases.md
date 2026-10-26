@@ -3,31 +3,44 @@
 This file records test coverage and platform runs. Supported API types are
 listed in the [type map](type-map.md).
 
-## Latest validation: 2026-10-26
+## Latest validation: 2026-10-27
 
-On macOS arm64, `SKIP_PACKAGES=1 scripts/check.sh` passed:
+The six-patch consolidation was checked on macOS arm64:
+
+- All six patches apply in order to the pinned upstream commit. Every
+  intermediate stage passes C++ syntax checking, and its embedded runtime
+  header matches the runtime sources.
+- The fully applied compiler tree matches the previous eight-patch result,
+  except for removing an obsolete patch-number comment. The runtime hash,
+  eight capability names and native ABI version are unchanged.
+- The compiler rebuild and `CARGO_TERM_COLOR=always SKIP_PACKAGES=1
+  scripts/check.sh` passed.
 
 | Check | Result |
 |---|---|
 | Workspace tests | Passed, including compile-fail fixtures, strict borrowing/allocation tests and mandatory layout verification |
-| Goose calling Rust, stock compiler | 23 passed, 8 skipped for unavailable compiler features |
-| Goose calling Rust, patched compiler | 31 passed |
-| Rust calling Goose | 14 basic checks on stock; 24 full checks on patched |
+| Goose calling Rust | Stock: 23 passed, 8 skipped for unavailable features; patched: 31 passed |
+| Rust calling Goose | Stock: 14 basic checks; patched: 24 full checks |
 | Plain C native provider | JIT/native builds, runtime hooks, typed builders and rejection cases passed |
 | Rust native provider | One-crate and combined two-crate programs passed under `goose run` and `goose build` |
+| Patch-guide examples | Five Goose callers, two Rust hosts, a native provider and a prebuilt package without Rust on PATH passed |
 
-A strict host package was also built and used without Rust on PATH.
-Packaging strict exports for a foreign target was rejected before the
-foreign build, as required by the current layout-verification policy.
+The original eight-patch compiler passed 4,763 baseline checks. The
+consolidation preserves that compiler's behavior; it does not add the
+conditional runtime-hook emission discussed in the performance guide.
+The ordinary Goose builder example emitted identical stock/patched function
+bodies at `-O0` and identical inlined caller bodies at `-O2`. These are
+code-generation checks, not latency measurements.
 
-The generic compiler patch series passed 4,763 baseline checks before the
-strict Rust attribute was added. The strict implementation made no further
-compiler changes. Optional graphics, audio, physics and UI layers were not
-built for that run.
+Before consolidation, [CI run 40214715127](https://github.com/Swoorup/ferrous-goose/actions/runs/40214715127)
+at `044c7a95` passed all seven jobs: Linux, macOS and Windows tests, the
+cross-platform package build, and no-Rust package checks on all three
+platforms. The consolidated series has been validated locally; that CI run
+covers the equivalent compiler source before the reorganization.
 
-The full package distribution was not rebuilt during this validation.
-Current native-provider and strict-export behavior has not been tested on
-Linux or Windows.
+Strict exports support host-target packaging only. Foreign targets are
+rejected before building because host metadata cannot verify their layouts.
+The full cross-platform package build was not repeated for the consolidation.
 
 ## Coverage by feature
 
@@ -47,14 +60,11 @@ Linux or Windows.
 
 ## Where it has run
 
-Earlier platform results apply to the original compiler series and bridge.
-They do not validate later native-provider or strict-export changes.
-
 | Platform | Recorded coverage |
 |---|---|
-| macOS arm64 | Latest validation above. Earlier runs also covered the standard package examples without Rust on PATH. |
+| macOS arm64 | Latest local checks above; the previous series also passed the full CI job and no-Rust package examples. |
+| Linux x86_64 | Previous series passed full CI tests, examples and no-Rust package checks at `044c7a95`. |
+| Windows x86_64 | Previous series passed full CI tests, JIT/native examples and no-Rust package checks at `044c7a95`. |
 | Linux arm64, Ubuntu 24.04 | Earlier compiler builds, conformance, examples and package examples passed. |
-| Linux x86_64 | Earlier package libraries built; no execution results recorded. |
-| macOS x86_64 | Earlier universal package libraries contain this architecture; no execution results recorded. |
-| Windows x86_64 | Earlier package libraries built; no execution results recorded. |
-| CI | [Workflow](../.github/workflows/ci.yml) defines Linux, macOS and Windows jobs, package builds and no-Rust checks. No CI results are recorded here. |
+| macOS x86_64 | Universal package libraries contain this architecture; no execution results recorded. |
+| CI | The [workflow](../.github/workflows/ci.yml) and successful run linked above cover all three runner platforms. |

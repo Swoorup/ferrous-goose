@@ -17,7 +17,7 @@ pub enum Link {
     /// `goose run` needs, and what Phase 1 uses everywhere.
     Dynamic(String),
     /// Plain `extern fn` declarations, the library linked into the program
-    /// (a `native_build` provider, goose-patches/0005).
+    /// (a `native_build` provider, goose-patches/0004).
     Static,
 }
 
@@ -28,11 +28,11 @@ pub struct Options {
     /// (goose-patches/0001). Without it, such results are counted, then
     /// copied into an array the wrapper sizes.
     pub typed_builders: bool,
-    /// The compiler has `align n` (goose-patches/0007): structs are
+    /// The compiler has `align n` (goose-patches/0006): structs are
     /// declared with Rust's alignment, so Goose keeps their values aligned
     /// and they are lent in place, and `#[goose(align)]` enums can cross.
     pub align: bool,
-    /// The compiler has `reentrant` externs (goose-patches/0008), which a
+    /// The compiler has `reentrant` externs (goose-patches/0003), which a
     /// function calling Goose back is declared as.
     pub reentrant: bool,
     /// Compiler layout JSON is available; required before exposing strict exports.
@@ -389,7 +389,7 @@ impl Generator<'_> {
             if f.reentrant && !self.o.reentrant {
                 let _ = writeln!(
                     self.wrappers,
-                    "// {}: calls the program back, which needs a compiler with reentrant externs (goose-patches/0008).\n",
+                    "// {}: calls the program back, which needs a compiler with reentrant externs (goose-patches/0003).\n",
                     f.name
                 );
                 continue;
@@ -397,7 +397,7 @@ impl Generator<'_> {
             if fn_uses(f, &self.skipped) {
                 let _ = writeln!(
                     self.wrappers,
-                    "// {}: uses a type this compiler cannot lay out as Rust does (align n, goose-patches/0007).\n",
+                    "// {}: uses a type this compiler cannot lay out as Rust does (align n, goose-patches/0006).\n",
                     f.name
                 );
                 continue;
@@ -449,7 +449,7 @@ impl Generator<'_> {
         }
         for e in &lib.enums {
             if self.skipped.contains(&e.name) {
-                let _ = writeln!(out, "// {}: #[goose(align)], which needs a compiler with align n (goose-patches/0007).\n", e.name);
+                let _ = writeln!(out, "// {}: #[goose(align)], which needs a compiler with align n (goose-patches/0006).\n", e.name);
                 continue;
             }
             comment(&mut out, &e.doc, "");

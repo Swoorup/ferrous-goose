@@ -109,7 +109,39 @@ measure ordinary calls on one machine; they do not measure re-entry,
 coroutines or every conversion. Copy counters, allocation counts and
 latency measure different properties.
 
-Interface emission and native providers add build work. Library loading
-and hooks add startup/shutdown work. Reentrant calls publish stack
-positions and check callback eligibility; successful symbol lookups are
-cached. Those costs remain under either copy policy.
+## Compiler and runtime costs
+
+The [six compiler patches](goose-patches.md) retain eight independently
+named capabilities. Combining patch files does not remove runtime work or
+change their behavior. The Rust strict-copy policy also leaves these costs
+in place.
+
+| Feature | Work when used | Behavior without the feature in the program |
+|---|---|---|
+| Typed builders | Element stores and stack/length updates; data-stack pages may need commitment | Ordinary Goose builder calls use their existing implementation |
+| Export results | Output-pointer writes; first-use scratch-stack initialization and resets for exported builders | No export scratch stacks without exported builder parameters |
+| Interface metadata | Compiler layout analysis and JSON output | No JSON output or runtime reflection |
+| Runtime hooks | Library hook discovery and initialization; registered shutdown callbacks | The current compiler still emits a shutdown-hook call; loading any external library probes for the optional hook symbol |
+| Native providers | External builds, combination, linking and caching; optional startup initializer | No provider runs without configuration; no added provider dispatch on ordinary calls |
+| Package libraries | Compile-time path resolution and startup loading/symbol resolution | No per-call package lookup |
+| Alignment | Alignment attributes, stack-top rounding and possibly larger enum layouts | Unannotated types keep their default layouts |
+| Re-entry | Stack publication in affected callers, callback checks and cached successful lookups | Registration scaffolding is still emitted; programs with exports get a callback table even without reentrant calls |
+
+`native::fill_squares(4, values)` can name an ordinary Goose function. The
+namespace does not imply a foreign call; `extern` establishes that boundary.
+A local comparison of the pinned stock and patched compilers found that
+an all-Goose typed-builder example emitted identical caller/callee bodies
+at `-O0` and identical inlined caller bodies at `-O2`.
+
+The complete generated programs differed: the patched version contained
+an empty `gs_register_reentry()` call and `gs_rt_end_hooks()` at shutdown,
+plus additional runtime declarations/helpers. Clang `-O2` eliminated the
+empty registration in the separate-runtime build; the shutdown call
+remained. Other backends and optimization settings may retain different
+amounts of this code. This was a generated-code comparison, not a latency,
+compiler-speed or whole-program binary-size benchmark.
+
+The series therefore does not promise zero overhead for unused native
+features. Conditional emission of unused hook and callback machinery is
+future work. The [patch guide](goose-patches.md) shows both language sides,
+stock alternatives, lifetime rules and the affected code-generation paths.

@@ -1,8 +1,10 @@
-From 06da3e6415c47f716afe47deb2a95a7cc9ed81c8 Mon Sep 17 00:00:00 2001
+From 3779c77ac32e7ca57d105626c4df448edf4708da Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Mon, 26 Oct 2026 00:34:26 +1100
+Date: Tue, 27 Oct 2026 00:38:28 +1100
 Subject: [PATCH] Resolve package libraries relative to their package
 
+Resolve package-local shared libraries and platform/architecture overrides
+so prebuilt native dependencies can be distributed with their Goose module.
 ---
  docs/packages.md   |  9 ++++++++-
  src/capabilities.h |  2 +-
@@ -30,15 +32,15 @@ index 30444b4e..0e62ac3b 100644
  `goose run` with no C toolchain installed. The rest of this section is
  about C the package compiles itself.
 diff --git a/src/capabilities.h b/src/capabilities.h
-index fa473207..09243cac 100644
+index 6210947f..965ae729 100644
 --- a/src/capabilities.h
 +++ b/src/capabilities.h
 @@ -2,4 +2,4 @@
  #pragma once
  
  #define GOOSE_NATIVE_ABI 1
--#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build"
-+#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs"
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build reentrant"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs reentrant"
 diff --git a/src/packages.h b/src/packages.h
 index f5183b81..75234f77 100644
 --- a/src/packages.h

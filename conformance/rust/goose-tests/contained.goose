@@ -1,6 +1,6 @@
 // test: build
 // test: needs runtime-hooks
-// A Rust abort in a contained worker (goose-patches/0004): only that worker
+// A Rust abort in a contained worker (goose-patches/0003): only that worker
 // ends, and thread_wait hands its message to the program, which runs on.
 import cf;
 

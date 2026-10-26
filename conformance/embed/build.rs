@@ -1,6 +1,6 @@
 fn main() {
     // The full program where the compiler takes several results and
-    // builders at the export boundary (goose-patches/0002), else the basic.
+    // builders at the export boundary (goose-patches/0001), else the basic.
     let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let goose = goose_build::find_goose(&dir).unwrap();
     let features = goose_build::goose_features(&goose).unwrap();

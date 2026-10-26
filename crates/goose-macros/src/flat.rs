@@ -6,7 +6,7 @@
 //! (whose Goose layout is a tag and a packed payload) is converted at the
 //! boundary, field by field, unless the enum is `#[goose(align)]`: a
 //! `#[repr(C, u8)]` enum Goose lays out as Rust does, with `align n`
-//! (goose-patches/0007), which crosses in place.
+//! (goose-patches/0006), which crosses in place.
 
 use crate::doc_of;
 use crate::info::library_info;

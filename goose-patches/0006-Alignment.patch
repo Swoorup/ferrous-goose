@@ -1,8 +1,10 @@
-From aacb45baeb47e263e09e8d44f06db4968acf7bfe Mon Sep 17 00:00:00 2001
+From 16e266ca656892b495e48525dc70f120def0e0a1 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Mon, 26 Oct 2026 00:34:27 +1100
+Date: Tue, 27 Oct 2026 00:38:28 +1100
 Subject: [PATCH] Support explicit alignment for structs and enums
 
+Preserve declared alignment in variables, arrays and runtime data stacks.
+Validate layouts and report alignment through the native interface metadata.
 ---
  docs/goose_spec.md      | 13 +++++++
  src/ast.h               |  7 ++++
@@ -20,7 +22,7 @@ Subject: [PATCH] Support explicit alignment for structs and enums
  13 files changed, 167 insertions(+), 16 deletions(-)
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index 7c1d990d..161c62d3 100644
+index 0f2ed1f9..a79dc2be 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
 @@ -265,6 +265,19 @@ struct X { a: i8[3], b: i32, c: i64 = 0 }
@@ -44,10 +46,10 @@ index 7c1d990d..161c62d3 100644
    is not assigned after construction (§4.4), and `const f: T` is `let f:
    const T`: its contents are read-only too (§9.5).
 diff --git a/src/ast.h b/src/ast.h
-index f6739302..79bc5090 100644
+index b30fe1ce..8d5d1819 100644
 --- a/src/ast.h
 +++ b/src/ast.h
-@@ -1496,6 +1496,10 @@ struct SStruct {
+@@ -1502,6 +1502,10 @@ struct SStruct {
      string_view name;
      string_view ns;             // As SFunction::ns / qname.
      string_view qname;
@@ -58,7 +60,7 @@ index f6739302..79bc5090 100644
      Line line;
      Line end;                   // As SFunction::end.
      string_view doc;            // As SFunction::doc.
-@@ -1526,6 +1530,9 @@ struct SEnum {
+@@ -1532,6 +1536,9 @@ struct SEnum {
      string_view name;
      string_view ns;             // As SFunction::ns / qname.
      string_view qname;
@@ -69,17 +71,17 @@ index f6739302..79bc5090 100644
      Line end;                   // As SFunction::end.
      string_view doc;            // As SFunction::doc.
 diff --git a/src/capabilities.h b/src/capabilities.h
-index 09243cac..1eaecbc4 100644
+index 965ae729..c6cd844d 100644
 --- a/src/capabilities.h
 +++ b/src/capabilities.h
 @@ -2,4 +2,4 @@
  #pragma once
  
  #define GOOSE_NATIVE_ABI 1
--#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs"
-+#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align"
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs reentrant"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align reentrant"
 diff --git a/src/codegen.h b/src/codegen.h
-index 26dd84eb..516feb68 100644
+index 14d7aeba..1c4ff73a 100644
 --- a/src/codegen.h
 +++ b/src/codegen.h
 @@ -311,7 +311,16 @@ struct CodeGen {
@@ -113,7 +115,7 @@ index 994ef40d..9403c68f 100644
                  L(flv, ".len = 0;");
                  GenConstruct(init, stk, ft, cat(flv, ".len"));
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 9255b598..4fa98cd6 100644
+index c15be11e..d5a3e385 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
 @@ -851,6 +851,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
@@ -305,7 +307,7 @@ index 7890a0cf..899b5886 100644
                  if (vi) out += ",";
                  auto &v = ei->en->variants[vi];
 diff --git a/src/parser.h b/src/parser.h
-index 25400ee2..148d1714 100644
+index a1f5ce4f..3c5b066b 100644
 --- a/src/parser.h
 +++ b/src/parser.h
 @@ -533,7 +533,7 @@ struct Parser {
@@ -369,10 +371,10 @@ index 25400ee2..148d1714 100644
                  v.line = CurLine();
                  v.doc = lex.doc;
 diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
-index 876788fc..6ae936a5 100644
+index ab0f08c0..4bd09c4f 100644
 --- a/src/runtime/runtime.h
 +++ b/src/runtime/runtime.h
-@@ -830,6 +830,15 @@ typedef struct {
+@@ -845,6 +845,15 @@ typedef struct {
     gets nothing more. */
  #define GOOSE_H 1
  
@@ -389,10 +391,10 @@ index 876788fc..6ae936a5 100644
     region's usable reservation and trailing guard gap, the address space
     budgeted for regions over the whole program, and the most regions the
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index ae901413..87a69a04 100644
+index e4686c79..9d69273c 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
-@@ -846,6 +846,15 @@ typedef struct {
+@@ -861,6 +861,15 @@ typedef struct {
     gets nothing more. */
  #define GOOSE_H 1
  
@@ -408,43 +410,43 @@ index ae901413..87a69a04 100644
  /* Starts the runtime on main's thread: the program's arguments, each
     region's usable reservation and trailing guard gap, the address space
     budgeted for regions over the whole program, and the most regions the
-@@ -881,7 +890,8 @@ typedef struct gs_dlbind {
-     void **slot;
- } gs_dlbind;
- /* Opens each library once and fills every slot, on the main thread before
--   the globals are initialized. A library that does not load, or a symbol it
-+)GSRT"
-+R"GSRT(   the globals are initialized. A library that does not load, or a symbol it
-    does not have, is a runtime error naming both. */
- GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *binds,
-                        int64_t nbinds);
-@@ -889,8 +899,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+@@ -880,7 +889,8 @@ GS_API void gs_release_regions(void);
  /* ---------------------------------------------------------------------------
-    Threads and typed queues (§11.2), runtime_threads.h. */
+    Dynamic externs (§7.10): the shared libraries the program's extern blocks
+    name, and the functions it calls through them, bound by name as the
+-   program starts (docs/design/dynamic_externs.md). */
++)GSRT"
++R"GSRT(   program starts (docs/design/dynamic_externs.md). */
  
+ /* A library: the name its block gives and, where the sidecar spells it for
+    a platform, that spelling; NULL where the platform derives its own
+@@ -888,8 +898,7 @@ GS_API void gs_release_regions(void);
+ typedef struct gs_dllib {
+     const char *name, *onwindows, *onmacos, *onlinux;
+ } gs_dllib;
 -)GSRT"
--R"GSRT(GS_API int64_t gs_hardware_threads(void);
-+GS_API int64_t gs_hardware_threads(void);
- /* Runs run(entry, args) and then release() on a new thread, args a copy of
-    argsize bytes, and returns the worker's id. In a contained worker an
-    abort ends run early. */
-@@ -1074,7 +1083,8 @@ static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
-     return (int64_t)(q - p);
+-R"GSRT(/* One function: its library's index in the table, the symbol the library
++/* One function: its library's index in the table, the symbol the library
+    is asked for, and the pointer the generated code calls through. */
+ typedef struct gs_dlbind {
+     int32_t lib;
+@@ -1066,7 +1075,8 @@ static int64_t gs_uleb_size(const uint8_t *p) {
+    which the emitting sites already assume (they form the element address
+    from the same text). A varint *value*, by contrast, is whatever the
+    program stored, so scalar fields and relative offsets keep the loop above
+-   inline, where the compilers peel the first byte themselves. */
++)GSRT"
++R"GSRT(   inline, where the compilers peel the first byte themselves. */
+ 
+ static GS_NOINLINE int64_t gs_uleb_read_slow(const uint8_t *p) {
+     return gs_uleb_read(p);
+@@ -1077,8 +1087,7 @@ static GS_NOINLINE int64_t gs_uleb_size_slow(const uint8_t *p) {
  }
  
--static int64_t gs_zig_read(const uint8_t *p) {
-+)GSRT"
-+R"GSRT(static int64_t gs_zig_read(const uint8_t *p) {
-     uint64_t u = (uint64_t)gs_uleb_read(p);
-     return (int64_t)((u >> 1) ^ (0u - (u & 1)));
- }
-@@ -1085,8 +1095,7 @@ static int64_t gs_zig_write(uint8_t *p, int64_t v) {
- 
- /* ---------------------------------------------------------------------------
-    Verified loading (docs/design/serialization.md): what the generated
+ #define GS_ULEB_READ(p) ((*(p) & 0x80) ? gs_uleb_read_slow(p) : (int64_t)*(p))
 -)GSRT"
--R"GSRT(   gs_verify_<T> walkers are built from. The bytes are untrusted until the
-+   gs_verify_<T> walkers are built from. The bytes are untrusted until the
-    walk finishes, so every read here is bounded by the image end and reports
-    a malformed encoding instead of running past it. */
+-R"GSRT(#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
++#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
  
+ static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
+     uint8_t *q = p;

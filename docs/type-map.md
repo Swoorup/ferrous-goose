@@ -25,7 +25,7 @@ reject the copy-producing forms.
 | `Option<&T>`, `Option<T>`, `Option<&str>`, ... | `T?` | one entry point per combination (`S_some`/`S_none`, `S_sn`...) | as the inner type |
 | `impl FnMut(A..) -> R`, `&mut dyn FnMut(..)` | the caller's block | the function runs as a coroutine: `S__start`, `S__next`, `S__reply`, `S__finish` | arguments are copied, since Goose code runs between the calls |
 | `T` generic with `instantiate(T = a, b)` | one overload per type | one symbol per type (`S_a`, `S_b`) | as each instantiation |
-| `&goose::Reentry` | nothing: not a Goose parameter | the extern is a `reentrant fn` (goose-patches/0008) | the program's main thread, and a compiler with the patch; unavailable compiler support omits the binding; an invalid thread/runtime aborts |
+| `&goose::Reentry` | nothing: not a Goose parameter | the extern is a `reentrant fn` (goose-patches/0003) | the program's main thread, and a compiler with the patch; unavailable compiler support omits the binding; an invalid thread/runtime aborts |
 
 ## Results
 
@@ -48,12 +48,12 @@ reject the copy-producing forms.
 
 | Rust | Goose |
 |---|---|
-| `#[derive(Flat)] #[repr(C)] struct` | `struct` with `pad n` where rustc put padding, `align n` with goose-patches/0007; borrowed in place when aligned |
+| `#[derive(Flat)] #[repr(C)] struct` | `struct` with `pad n` where rustc put padding, `align n` with goose-patches/0006; borrowed in place when aligned |
 | a struct holding a converted enum | `struct` packed; converted field by field |
 | fieldless `#[repr(u8)] enum`, variants numbered from 0 | `enum`, one byte, in place |
 | a fieldless enum with explicit discriminants | `enum`; converted by index |
 | an enum with data | `enum` (a tag and the largest payload, packed); converted, a slice in one pass |
-| `#[goose(align)] #[repr(C, u8)] enum` | `enum` with `align n` and rustc's pads (goose-patches/0007); in place |
+| `#[goose(align)] #[repr(C, u8)] enum` | `enum` with `align n` and rustc's pads (goose-patches/0006); in place |
 | `[T; N]` | `T[N]` |
 | `#[goose::handle] struct` | `struct { slot: u32, generation: u32 }`, with `release`, `live_count_<name>`, and `with_<constructor>` scoped helpers |
 
@@ -61,7 +61,7 @@ reject the copy-producing forms.
 
 Each `fn name(..) -> R;` in the macro becomes `name(goose: &Reentry, ..) ->
 Result<R, ReentryError>`, calling the program's `export fn name` with the
-Goose signature below (goose-patches/0008).
+Goose signature below (goose-patches/0003).
 
 | Callback parameter (Rust) | The export fn's parameter (Goose) |
 |---|---|
@@ -86,8 +86,8 @@ Async functions, Rust closures kept as values, trait objects other than
 | `T` (a struct or enum) by value or `const T&`/`T&` | the mirror struct (`#[repr(C, packed)]`, or `#[repr(C, align(n))]` for `align n`), `&T`, `&mut T` |
 | `const T[:]`, `T[:]` | `&[T]`, `&mut [T]` |
 | `const u8[:]` result | `&'a [u8]`, borrowed for as long as the runtime and the arguments |
-| several results (goose-patches/0002) | a tuple |
-| `u8[>..]&`, `T[>..]&` parameter (goose-patches/0002) | taken out of the parameters; the elements come back in the result, borrowed from the runtime's scratch builder for as long as `&mut Runtime` is |
+| several results (goose-patches/0001) | a tuple |
+| `u8[>..]&`, `T[>..]&` parameter (goose-patches/0001) | taken out of the parameters; the elements come back in the result, borrowed from the runtime's scratch builder for as long as `&mut Runtime` is |
 
 Every wrapper takes `&Runtime` (or `&mut Runtime` where a builder is
 involved), which is neither `Send` nor `Sync`: the Rust compiler keeps every

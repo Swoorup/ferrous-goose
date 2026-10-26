@@ -54,7 +54,7 @@ fn main() {
 
     #[cfg(goose_full)]
     {
-        // Several results (goose-patches/0002).
+        // Several results (goose-patches/0001).
         let (cfg, ok) = embed::parse_config(&rt, b"verbose");
         let (level, verbose) = (cfg.level, cfg.verbose);
         check(ok && level == 7 && verbose, "parse_config");
@@ -73,7 +73,7 @@ fn main() {
         let (words, nums) = embed::two_builders(&mut rt, 3);
         check(words == b"w0 w1 w2 " && nums == [0, 10, 20], "two builders");
 
-        // Aligned structs (goose-patches/0007): Rust's own alignment.
+        // Aligned structs (goose-patches/0006): Rust's own alignment.
         check(std::mem::align_of::<embed::Hit>() == 8 && std::mem::size_of::<embed::Hit>() == 24, "Hit layout");
         let mk = |t: f32, id: u64, hit: bool| embed::Hit { t, id, hit, ..Default::default() };
         let hits = [mk(3.5, 1, true), mk(1.25, 2, true), mk(0.5, 3, false)];

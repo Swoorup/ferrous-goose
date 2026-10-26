@@ -1,0 +1,928 @@
+From a8ed8318ff809f2a59c4dfaf17c576a50f3c2ee3 Mon Sep 17 00:00:00 2001
+From: Goose contributors <goose@example.invalid>
+Date: Tue, 27 Oct 2026 00:38:28 +1100
+Subject: [PATCH] Provide runtime hooks and reentrant native callbacks
+
+Provide native libraries with versioned abort, shutdown and callback hooks.
+Publish live stack tops for reentrant calls and expose eligible exports by
+name and signature, restricting callbacks to the program thread and exports
+that do not access mutable globals.
+---
+ docs/goose_spec.md         |  23 +++-
+ src/ast.h                  |   6 ++
+ src/capabilities.h         |   2 +-
+ src/codegen.h              |   1 +
+ src/codegen_emit.h         |  71 ++++++++++++-
+ src/native.h               |   1 +
+ src/parser.h               |   8 +-
+ src/runtime/goose.h        |  16 +++
+ src/runtime/runtime.h      |  33 +++++-
+ src/runtime/runtime_impl.h |  66 +++++++++++-
+ src/runtime/runtime_os.h   |   3 +
+ src/runtime_inline.h       | 209 ++++++++++++++++++++++++++++---------
+ 12 files changed, 380 insertions(+), 59 deletions(-)
+
+diff --git a/docs/goose_spec.md b/docs/goose_spec.md
+index b0ff6c2c..0f2ed1f9 100644
+--- a/docs/goose_spec.md
++++ b/docs/goose_spec.md
+@@ -2971,7 +2971,28 @@ cannot load SDL2 (libSDL2.so): libSDL2.so: cannot open shared object file: No su
+ SDL2 (libSDL2.so) has no symbol SDL_Foo
+ ```
+ 
+-A library is never closed. A `main_thread_only` package (docs/packages.md)
++**Calls back.** `reentrant` before an extern's `fn` (`extern reentrant fn
++walk(t: Tree);`, or `reentrant fn walk(t: Tree);` in a block) says its C may
++call the program's export fns back while it runs. Each caller, and theirs,
++publishes every cached data stack top before the call, so a call back
++starts above all live data, the elements of a builder the extern was
++handed included, and leaves the stacks as it found them: C appending to
++such a builder after a call back appends where it would have. C finds an
++export fn through the runtime's hooks (below), by its C symbol and its
++signature as Goose writes it (`i64,const u8[:]->bool`), and only on the main
++program's thread, whose stacks the export wrappers use. Only an export fn
++that touches no `var` global, itself or through its callees, can be called
++back: the code a call back interrupts assumed the extern left the globals
++alone, and may hold references into them.
++
++A library that exports `void goose_runtime_hooks(const gs_rt_hooks *)` is
++handed the runtime's hooks as it is opened (`goose.h` declares the struct):
++`abort_msg(msg, len, file, line)`, which ends the program exactly as
++`abort(msg)` does, or only the worker in a contained one (§11.2), and
++`at_end(fn)`, which has the runtime call `fn` when the program ends, by a
++return from `main` or by `exit`; and, from version 2, `reentry_lookup(name,
++sig, &why)`, the wrapper of an export fn a call back may reach, and
++`on_program_thread()`. A library never sees a hook it did not ask for. A library is never closed. A `main_thread_only` package (docs/packages.md)
+ applies to its block's members as to its other externs. A variadic C
+ function cannot be bound: the declaration has no way to say so, and
+ calling one through a fixed-arity pointer is undefined. The generated C is
+diff --git a/src/ast.h b/src/ast.h
+index 403b0eaa..5628c2fe 100644
+--- a/src/ast.h
++++ b/src/ast.h
+@@ -1468,6 +1468,12 @@ struct SFunction {
+     // (os.trim_memory): each caller, and transitively theirs, publishes all
+     // of its cached tops before the call (CodeGen::CollectSpecs, SyncReach).
+     bool readsalltops = false;
++    // `reentrant`: the C behind it may call the
++    // program's export fns back while it runs. Its callers publish every
++    // cached stack top first (readsalltops), so a call back starts above all
++    // live data, a builder's elements included, and returns the stacks as
++    // it found them.
++    bool reentrant = false;
+     bool isnested = false;
+     SFunction *outer = nullptr;     // The function a nested one is declared in.
+     Block *body = nullptr;
+diff --git a/src/capabilities.h b/src/capabilities.h
+index af25e01f..8f27d976 100644
+--- a/src/capabilities.h
++++ b/src/capabilities.h
+@@ -2,4 +2,4 @@
+ #pragma once
+ 
+ #define GOOSE_NATIVE_ABI 1
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks reentrant"
+diff --git a/src/codegen.h b/src/codegen.h
+index 26dd84eb..14d7aeba 100644
+--- a/src/codegen.h
++++ b/src/codegen.h
+@@ -1420,6 +1420,7 @@ struct CodeGen {
+     void EmitProgramInit();
+     void EmitExports();
+     int64_t ExportScratchStacks();
++    void EmitReentryTable();
+     string MainCall();
+     void EmitMain();
+ 
+diff --git a/src/codegen_emit.h b/src/codegen_emit.h
+index 26773948..1267dce2 100644
+--- a/src/codegen_emit.h
++++ b/src/codegen_emit.h
+@@ -895,6 +895,8 @@ inline void CodeGen::EmitProgramInit() {
+     if (!dllibs.empty())
+         Append(code, "    gs_dl_bind(gs_dllibs, ", dllibs.size(), ", gs_dlbinds, ", dlbinds,
+                ");\n");
++    Append(data, "static void gs_register_reentry(void);\n");
++    Append(code, "    gs_register_reentry();\n");
+     // The queues, before anything that could use one runs.
+     vector<string> qnames;
+     for (auto &[m, q] : queues) qnames.push_back(q);
+@@ -1057,6 +1059,73 @@ inline void CodeGen::EmitExports() {
+         }
+         Append(code, "}\n\n");
+     }
++    EmitReentryTable();
++}
++
++// The table a call back from C finds export fns in:
++// each one's C symbol, its signature as Goose writes it, its wrapper, and
++// whether a call back may reach it: one that touches no `var` global, so
++// that the code it interrupts, which assumed an extern leaves the globals
++// alone (§7.10), and which may hold references into them, stays right.
++// Whether the specialization, or anything it calls, names a `var` global.
++// `memo` holds the answers so far; a specialization being walked counts as
++// not touching one, which its other paths settle.
++static bool TouchesVarGlobal(FnSpec *sp, map<FnSpec *, bool> &memo) {
++    if (!sp) return false;
++    auto it = memo.find(sp);
++    if (it != memo.end()) return it->second;
++    memo[sp] = false;
++    auto found = false;
++    function<void(Node *)> walk = [&](Node *n) {
++        if (!n || found) return;
++        if (auto id = Is<Ident>(n))
++            if (id->vdef && id->vdef->isglobal && id->vdef->isvar) found = true;
++        if (auto c = Is<Call>(n)) {
++            if (c->builtin < 0 && TouchesVarGlobal(c->spec, memo)) found = true;
++            for (auto d : c->dispatch)
++                if (TouchesVarGlobal(d, memo)) found = true;
++            for (auto &fs : c->fmtspecs)
++                if (TouchesVarGlobal(fs.second, memo)) found = true;
++        }
++        RunChildren(n, walk);
++    };
++    walk(sp->body);
++    memo[sp] = found;
++    return found;
++}
++
++inline void CodeGen::EmitReentryTable() {
++    string rows;
++    int64_t n = 0;
++    map<FnSpec *, bool> touched;
++    for (auto sf : ast.functions) {
++        if (!sf->isexport || sf->specs.size() != 1 || !sinfo.count(sf->specs[0])) continue;
++        auto sp = sf->specs[0];
++        string sig;
++        for (size_t i = 0; i < sp->argtypes.size(); i++) {
++            string t;
++            sp->argtypes[i]->Dump(t);
++            Append(sig, i ? "," : "", t);
++        }
++        sig += "->";
++        for (size_t i = 0; i < sp->rets.size(); i++) {
++            string t;
++            sp->rets[i]->Dump(t);
++            Append(sig, i ? "," : "", t);
++        }
++        auto safe = !TouchesVarGlobal(sp, touched);
++        // Type text holds no quote or backslash to escape.
++        auto esc = cat("\"", sig, "\"");
++        Append(rows, "    { \"", sf->cname, "\", ", esc, ", (void (*)(void))", sf->cname, ", ", safe ? 1 : 0,
++               " },\n");
++        n++;
++    }
++    if (n)
++        Append(code, "static const gs_reentry_entry gs_reentry_table[] = {\n", rows, "};\n"
++                     "static void gs_register_reentry(void) { gs_rt_set_reentry(gs_reentry_table, ", n,
++               "); }\n\n");
++    else
++        Append(code, "static void gs_register_reentry(void) {}\n\n");
+ }
+ 
+ inline string CodeGen::ExportHeader() {
+@@ -1074,7 +1143,7 @@ inline string CodeGen::ExportHeader() {
+ 
+ inline void CodeGen::EmitMain() {
+     Append(code, "int main(int argc, char **argv) {\n    gs_program_init(argc, argv);\n",
+-           MainCall(), "    gs_rt_stats();\n    return 0;\n}\n");
++           MainCall(), "    gs_rt_stats();\n    gs_rt_end_hooks();\n    return 0;\n}\n");
+ }
+ 
+ }  // namespace goose
+diff --git a/src/native.h b/src/native.h
+index 00cdeccf..a0db140b 100644
+--- a/src/native.h
++++ b/src/native.h
+@@ -87,6 +87,7 @@ inline void ExternNamesIn(const string &path, const string &text, set<string> &n
+             } while (depth > 0 && lex.tok != T_EOF);
+             continue;
+         }
++        if (lex.tok == T_IDENT && lex.attr == "reentrant") lex.Next();
+         if (lex.tok != T_FN) continue;
+         lex.Next();
+         if (lex.tok == T_IDENT) {
+diff --git a/src/parser.h b/src/parser.h
+index 25400ee2..a1f5ce4f 100644
+--- a/src/parser.h
++++ b/src/parser.h
+@@ -742,6 +742,12 @@ struct Parser {
+         }
+         sf->isrec = IsNext(T_RECURSIVE);
+         if (sf->isinline && sf->isrec) Error("recursive fn cannot be inline");
++        // `reentrant fn`: an extern whose C may call export fns back.
++        if (lex.tok == T_IDENT && lex.attr == "reentrant" && lex.PeekTok() == T_FN) {
++            if (!sf->isextern) Error("only an extern fn is reentrant: its C calls the program's export fns back");
++            sf->reentrant = true;
++            lex.Next();
++        }
+         if (lex.tok == T_THREADFN) {
+             if (sf->isinline) Error("thread_fn cannot be inline");
+             sf->isthread = true;
+@@ -821,7 +827,7 @@ struct Parser {
+                 if (sf->cname.empty()) sf->cname = string(sf->name);
+                 // The runtime entry points that read every stack top through
+                 // the registry rather than through their arguments.
+-                sf->readsalltops = sf->cname == "gs_trim_memory";
++                sf->readsalltops = sf->cname == "gs_trim_memory" || sf->reentrant;
+                 Expect(T_SEMI, "extern declaration");
+             } else if (lex.tok == T_ASSIGN) {
+                 Error("only an extern fn takes a symbol after its signature: = \"symbol\" (§7.10)");
+diff --git a/src/runtime/goose.h b/src/runtime/goose.h
+index 3819ad62..637fee90 100644
+--- a/src/runtime/goose.h
++++ b/src/runtime/goose.h
+@@ -38,6 +38,22 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+     b.hdr->len += n;
+ }
+ 
++/* The runtime's hooks, which a library that exports
++   `void goose_runtime_hooks(const gs_rt_hooks *)` is handed as the program
++   opens it (spec 7.10): abort_msg ends the program as abort(msg) does, or
++   only the worker in a contained one; at_end has a function called as the
++   program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++    /* Version 2: the export fn C may call back from a reentrant extern
++       (spec 7.10), by name and signature; and whether this thread runs the
++       main program. */
++    void *(*reentry_lookup)(const char *name, const char *sig, const char **why);
++    int (*on_program_thread)(void);
++} gs_rt_hooks;
++
+ /* Appends `count` elements of `size` bytes each to the T[>..] a typed
+    builder points at (spec 7.10): the bytes are the elements as Goose lays
+    them out, packed, and the header counts elements, not bytes. */
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 596ef768..ab0f08c0 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -181,6 +181,34 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
+ GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
+                                      int line);
+ GS_API GS_NORETURN void gs_exit(int64_t code);
++/* What a library an extern block opens may take from the runtime: one that
++   exports goose_runtime_hooks gets them as it is opened (gs_dl_bind), one
++   linked into the program as the program starts. abort_msg ends the program
++   as abort(msg) does, or only the worker in a contained one; at_end has the
++   runtime call a function when the program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++    /* Version 2: the wrapper of the export fn `name`
++       whose signature is `sig`, for C a reentrant extern runs to call back;
++       NULL, with *why saying why, where there is none it may call. And
++       whether the calling thread runs the main program, whose stacks the
++       export wrappers use. */
++    void *(*reentry_lookup)(const char *name, const char *sig, const char **why);
++    int (*on_program_thread)(void);
++} gs_rt_hooks;
++/* An export fn a call back may reach (gs_register_reentry, generated). */
++typedef struct {
++    const char *name;
++    const char *sig;
++    void (*fn)(void);
++    int safe;
++} gs_reentry_entry;
++GS_API void gs_rt_set_reentry(const gs_reentry_entry *table, int64_t n);
++GS_API void gs_at_end(void (*fn)(void));
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *));
++GS_API void gs_rt_end_hooks(void);
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line);
+ GS_API GS_NORETURN void gs_divfail(const char *file, int line);
+ GS_API GS_NORETURN void gs_divovf(const char *file, int line);
+@@ -812,8 +840,9 @@ typedef struct {
+ } gs_stack;
+ 
+ /* The program defines what goose.h gives C compiled on its own (gs_stack
+-   here, gs_rhdr, gs_rref and gs_bld_append after the generated types), so
+-   an --include header including it gets nothing more. */
++   here, gs_rhdr, gs_rref, gs_bld_append and gs_bld_push after the generated
++   types, gs_rt_hooks with the aborts), so an --include header including it
++   gets nothing more. */
+ #define GOOSE_H 1
+ 
+ /* Starts the runtime on main's thread: the program's arguments, each
+diff --git a/src/runtime/runtime_impl.h b/src/runtime/runtime_impl.h
+index 890cb70b..0a4b997f 100644
+--- a/src/runtime/runtime_impl.h
++++ b/src/runtime/runtime_impl.h
+@@ -68,18 +68,20 @@ static GS_TLS gs_contained *gs_contain;
+ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, int line) {
+     static const char lead[] = "goose runtime error: ";
+     int64_t pre = sizeof lead - 1;
+-    int64_t loc = snprintf(NULL, 0, " (%s:%d)\n", file, line);
++    /* A place with no line (a library's own, gs_rt_hooks) is named alone. */
++    const char *locfmt = line > 0 ? " (%s:%d)\n" : " (%s)\n";
++    int64_t loc = snprintf(NULL, 0, locfmt, file, line);
+     uint8_t *text = (uint8_t *)malloc((size_t)(pre + len + loc + 1));
+     if (!text) {
+         if (gs_contain) gs_panic("out of memory recording an aborted thread");
+         fputs(lead, stderr);
+         fwrite(msg, 1, (size_t)len, stderr);
+-        fprintf(stderr, " (%s:%d)\n", file, line);
++        fprintf(stderr, locfmt, file, line);
+         gs_end(1);
+     }
+     memcpy(text, lead, (size_t)pre);
+     if (len) memcpy(text + pre, msg, (size_t)len);
+-    snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
++    snprintf((char *)text + pre + len, (size_t)loc + 1, locfmt, file, line);
+     if (gs_contain) {
+         memmove(text, text + pre, (size_t)(len + loc - 1));
+         gs_contain->msg = text;
+@@ -113,6 +115,53 @@ GS_API GS_NORETURN void gs_exit(int64_t code) {
+     gs_end((int)code);
+ }
+ 
++/* The functions libraries asked to have called as the program ends
++   (gs_rt_hooks), each once, from the first thread that ends it. */
++static void (*gs_end_fns[16])(void);
++static int gs_nend_fns;
++
++GS_API void gs_at_end(void (*fn)(void)) {
++    if (gs_nend_fns < 16) gs_end_fns[gs_nend_fns++] = fn;
++}
++
++GS_API void gs_rt_end_hooks(void) {
++    while (gs_nend_fns > 0) gs_end_fns[--gs_nend_fns]();
++}
++
++static const gs_reentry_entry *gs_reentry_tab;
++static int64_t gs_reentry_n;
++
++GS_API void gs_rt_set_reentry(const gs_reentry_entry *table, int64_t n) {
++    gs_reentry_tab = table;
++    gs_reentry_n = n;
++}
++
++/* Called from C on the main program's thread only (gs_on_program_thread),
++   so one buffer serves the reasons. */
++static void *gs_reentry_lookup(const char *name, const char *sig, const char **why) {
++    static char reason[512];
++    for (int64_t i = 0; i < gs_reentry_n; i++) {
++        const gs_reentry_entry *e = &gs_reentry_tab[i];
++        if (strcmp(e->name, name)) continue;
++        if (!e->safe) {
++            snprintf(reason, sizeof reason, "export fn %s uses a var global, so it cannot be called "
++                     "back during a call into C", name);
++            if (why) *why = reason;
++            return NULL;
++        }
++        if (strcmp(e->sig, sig)) {
++            snprintf(reason, sizeof reason, "export fn %s is (%s), not (%s)", name, e->sig, sig);
++            if (why) *why = reason;
++            return NULL;
++        }
++        return (void *)e->fn;
++    }
++    snprintf(reason, sizeof reason, "the program has no export fn %s", name);
++    if (why) *why = reason;
++    return NULL;
++}
++
++
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line) {
+     gs_failf(file, line, "index %lld out of bounds (length %lld)", (long long)i, (long long)n);
+ }
+@@ -182,6 +231,16 @@ static char **gs_argv;
+ static size_t gs_region_usable, gs_region_gap, gs_region_reserve, gs_region_page;
+ /* The worker running on this thread, main's being -1 (runtime_threads.h). */
+ static GS_TLS int64_t gs_current_thread_id = -1;
++
++/* Whether the calling thread runs the main program, whose stacks the export
++   wrappers use (gs_rt_hooks). */
++static int gs_on_program_thread(void) { return gs_current_thread_id < 0; }
++
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *)) {
++    static const gs_rt_hooks hooks = { 2, gs_abort_msg, gs_at_end, gs_reentry_lookup,
++                                       gs_on_program_thread };
++    hook(&hooks);
++}
+ /* The program's address space budget for regions and the most regions its
+    main program and any one worker can hold, as gs_rt_start was told, and
+    the workers that leaves room for: what hardware_threads() reports at
+@@ -617,6 +676,7 @@ static GS_NORETURN void gs_park(void) {
+ 
+ static GS_NORETURN void gs_end(int code) {
+     if (!gs_end_first()) gs_park();
++    gs_rt_end_hooks();
+     fflush(NULL);
+     #ifdef __TINYC__
+         if (gs_current_thread_id < 0) exit(code);
+diff --git a/src/runtime/runtime_os.h b/src/runtime/runtime_os.h
+index dc6d8dc8..f33914f2 100644
+--- a/src/runtime/runtime_os.h
++++ b/src/runtime/runtime_os.h
+@@ -588,6 +588,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      spelling, (unsigned)GetLastError());
+             gs_panic(msg);
+         }
++        void *hooks = (void *)GetProcAddress(h, "goose_runtime_hooks");
+ #else
+         void *h = dlopen(spelling, RTLD_NOW | RTLD_LOCAL);
+         if (!h) {
+@@ -596,7 +597,9 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      why ? why : "unknown error");
+             gs_panic(msg);
+         }
++        void *hooks = dlsym(h, "goose_runtime_hooks");
+ #endif
++        if (hooks) gs_rt_give_hooks((void (*)(const gs_rt_hooks *))hooks);
+         for (int64_t b = 0; b < nbinds; b++) {
+             if (binds[b].lib != l) continue;
+ #ifdef _WIN32
+diff --git a/src/runtime_inline.h b/src/runtime_inline.h
+index 1630cf08..e4686c79 100644
+--- a/src/runtime_inline.h
++++ b/src/runtime_inline.h
+@@ -193,10 +193,38 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
+ GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
+                                      int line);
+ GS_API GS_NORETURN void gs_exit(int64_t code);
++/* What a library an extern block opens may take from the runtime: one that
++   exports goose_runtime_hooks gets them as it is opened (gs_dl_bind), one
++)GSRT"
++R"GSRT(   linked into the program as the program starts. abort_msg ends the program
++   as abort(msg) does, or only the worker in a contained one; at_end has the
++   runtime call a function when the program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++    /* Version 2: the wrapper of the export fn `name`
++       whose signature is `sig`, for C a reentrant extern runs to call back;
++       NULL, with *why saying why, where there is none it may call. And
++       whether the calling thread runs the main program, whose stacks the
++       export wrappers use. */
++    void *(*reentry_lookup)(const char *name, const char *sig, const char **why);
++    int (*on_program_thread)(void);
++} gs_rt_hooks;
++/* An export fn a call back may reach (gs_register_reentry, generated). */
++typedef struct {
++    const char *name;
++    const char *sig;
++    void (*fn)(void);
++    int safe;
++} gs_reentry_entry;
++GS_API void gs_rt_set_reentry(const gs_reentry_entry *table, int64_t n);
++GS_API void gs_at_end(void (*fn)(void));
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *));
++GS_API void gs_rt_end_hooks(void);
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line);
+ GS_API GS_NORETURN void gs_divfail(const char *file, int line);
+-)GSRT"
+-R"GSRT(GS_API GS_NORETURN void gs_divovf(const char *file, int line);
++GS_API GS_NORETURN void gs_divovf(const char *file, int line);
+ /* The debug build's failing overflow and `as` checks. */
+ GS_API GS_NORETURN void gs_ovf(int64_t a, const char *op, int64_t b, const char *type,
+                                const char *file, int line);
+@@ -327,7 +355,8 @@ static inline int gs_simd_level(void) {
+ #define GS_MEMZERO(d, n) \
+     (GS_KSZ(n, 8, 8) ? (void)(GS_AT(uint64_t, d, 0) = 0) \
+      : GS_KSZ(n, 4, 4) ? (void)(GS_AT(uint32_t, d, 0) = 0) \
+-     : GS_KSZ(n, 1, 1) ? (void)(GS_AT(uint8_t, d, 0) = 0) \
++)GSRT"
++R"GSRT(     : GS_KSZ(n, 1, 1) ? (void)(GS_AT(uint8_t, d, 0) = 0) \
+      : GS_KSZ(n, 2, 2) ? (void)(GS_AT(uint16_t, d, 0) = 0) \
+      : GS_KSZ(n, 3, 3) ? (void)(GS_AT(uint16_t, d, 0) = 0, GS_AT(uint8_t, d, 2) = 0) \
+      : GS_KSZ(n, 5, 7) ? (void)(GS_AT(uint32_t, d, 0) = 0, GS_AT(uint32_t, d, (n) - 4) = 0) \
+@@ -356,8 +385,7 @@ static uint64_t gs_bytemask(int64_t k) {
+ }
+ 
+ /* memcpy, memmove and memcmp for a slice's elements. An empty slice's data
+-)GSRT"
+-R"GSRT(   pointer is NULL where the slice was zero-filled (default<T>(), a default
++   pointer is NULL where the slice was zero-filled (default<T>(), a default
+    element), and C leaves all three undefined on a null pointer even for
+    zero bytes. A copy of up to 16 bytes loads both overlapping halves before
+    it stores them, and one of up to 256 bytes moves 16 at a time, the last 16
+@@ -490,7 +518,8 @@ static int gs_memeq(const void *a, const void *b, size_t n) {
+ static T gs_div_##SFX(T a, T b, const char *file, int line) { \
+     if (b == 0) gs_divfail(file, line); \
+     int64_t r = (int64_t)a / (int64_t)b; \
+-    if (r < (MIN) || r > (MAX)) gs_ovf(a, "/", b, #SFX, file, line); \
++)GSRT"
++R"GSRT(    if (r < (MIN) || r > (MAX)) gs_ovf(a, "/", b, #SFX, file, line); \
+     return (T)r; }
+ GS_DIVOPS_S(i8, int8_t, -128, 127)
+ GS_DIVOPS_S(i16, int16_t, -32768, 32767)
+@@ -523,8 +552,7 @@ static T gs_neg_##SFX(T a, const char *file, int line) { \
+     if (r < MIN || r > MAX) gs_ovf_neg(a, #SFX, file, line); \
+     return (T)r; } \
+ static T gs_shl_##SFX(T a, int64_t n) { \
+-)GSRT"
+-R"GSRT(    return (T)((uint64_t)a << (n & (BITS - 1))); } \
++    return (T)((uint64_t)a << (n & (BITS - 1))); } \
+ static T gs_shr_##SFX(T a, int64_t n) { \
+     return (T)((int64_t)a >> (n & (BITS - 1))); }
+ 
+@@ -665,7 +693,8 @@ static uint64_t gs_div128_u64(uint64_t hi, uint64_t d, uint64_t *rem) {
+     return (uint64_t)(n / d);
+ #endif
+ }
+-#elif defined(_MSC_VER) && _MSC_VER >= 1920 && defined(_M_X64)
++)GSRT"
++R"GSRT(#elif defined(_MSC_VER) && _MSC_VER >= 1920 && defined(_M_X64)
+ #include <intrin.h>
+ #define GS_HAVE_U128 1
+ static uint64_t gs_mulhi_u64(uint64_t a, uint64_t b) { return __umulh(a, b); }
+@@ -711,8 +740,7 @@ static uint64_t gs_divu_q(uint64_t x, uint64_t magic, uint8_t more) {
+     return q >> more;
+ #else
+     (void)magic;
+-)GSRT"
+-R"GSRT(    return x >> more;   /* Never called: GS_DIVU_NONE takes the operator. */
++    return x >> more;   /* Never called: GS_DIVU_NONE takes the operator. */
+ #endif
+ }
+ 
+@@ -828,8 +856,9 @@ typedef struct {
+ } gs_stack;
+ 
+ /* The program defines what goose.h gives C compiled on its own (gs_stack
+-   here, gs_rhdr, gs_rref and gs_bld_append after the generated types), so
+-   an --include header including it gets nothing more. */
++   here, gs_rhdr, gs_rref, gs_bld_append and gs_bld_push after the generated
++   types, gs_rt_hooks with the aborts), so an --include header including it
++   gets nothing more. */
+ #define GOOSE_H 1
+ 
+ /* Starts the runtime on main's thread: the program's arguments, each
+@@ -859,7 +888,8 @@ GS_API void gs_release_regions(void);
+ typedef struct gs_dllib {
+     const char *name, *onwindows, *onmacos, *onlinux;
+ } gs_dllib;
+-/* One function: its library's index in the table, the symbol the library
++)GSRT"
++R"GSRT(/* One function: its library's index in the table, the symbol the library
+    is asked for, and the pointer the generated code calls through. */
+ typedef struct gs_dlbind {
+     int32_t lib;
+@@ -886,8 +916,7 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
+    `msg` is not NULL, the first such wait for a worker that aborted takes its
+    message: `msg` and `len` are set to it, which the caller frees with
+    gs_free_msg, or to NULL and no bytes. */
+-)GSRT"
+-R"GSRT(GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
++GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
+                                const char *file, int line);
+ GS_API void gs_free_msg(uint8_t *msg);
+ 
+@@ -1048,7 +1077,8 @@ static GS_NOINLINE int64_t gs_uleb_size_slow(const uint8_t *p) {
+ }
+ 
+ #define GS_ULEB_READ(p) ((*(p) & 0x80) ? gs_uleb_read_slow(p) : (int64_t)*(p))
+-#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
++)GSRT"
++R"GSRT(#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
+ 
+ static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
+     uint8_t *q = p;
+@@ -1087,8 +1117,7 @@ static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out
+         b = *q++;
+         if (shift > 63 || (shift == 63 && (b & 0x7e))) return 0;
+         v |= (uint64_t)(b & 0x7f) << shift;
+-)GSRT"
+-R"GSRT(        if (!(b & 0x80)) {
++        if (!(b & 0x80)) {
+             if (shift && !b) return 0;  /* Redundant high zero group. */
+             break;
+         }
+@@ -1223,18 +1252,20 @@ static GS_TLS gs_contained *gs_contain;
+ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, int line) {
+     static const char lead[] = "goose runtime error: ";
+     int64_t pre = sizeof lead - 1;
+-    int64_t loc = snprintf(NULL, 0, " (%s:%d)\n", file, line);
++    /* A place with no line (a library's own, gs_rt_hooks) is named alone. */
++    const char *locfmt = line > 0 ? " (%s:%d)\n" : " (%s)\n";
++    int64_t loc = snprintf(NULL, 0, locfmt, file, line);
+     uint8_t *text = (uint8_t *)malloc((size_t)(pre + len + loc + 1));
+     if (!text) {
+         if (gs_contain) gs_panic("out of memory recording an aborted thread");
+         fputs(lead, stderr);
+         fwrite(msg, 1, (size_t)len, stderr);
+-        fprintf(stderr, " (%s:%d)\n", file, line);
++        fprintf(stderr, locfmt, file, line);
+         gs_end(1);
+     }
+     memcpy(text, lead, (size_t)pre);
+     if (len) memcpy(text + pre, msg, (size_t)len);
+-    snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
++    snprintf((char *)text + pre + len, (size_t)loc + 1, locfmt, file, line);
+     if (gs_contain) {
+         memmove(text, text + pre, (size_t)(len + loc - 1));
+         gs_contain->msg = text;
+@@ -1268,6 +1299,53 @@ GS_API GS_NORETURN void gs_exit(int64_t code) {
+     gs_end((int)code);
+ }
+ 
++/* The functions libraries asked to have called as the program ends
++   (gs_rt_hooks), each once, from the first thread that ends it. */
++static void (*gs_end_fns[16])(void);
++static int gs_nend_fns;
++
++GS_API void gs_at_end(void (*fn)(void)) {
++    if (gs_nend_fns < 16) gs_end_fns[gs_nend_fns++] = fn;
++}
++
++GS_API void gs_rt_end_hooks(void) {
++    while (gs_nend_fns > 0) gs_end_fns[--gs_nend_fns]();
++}
++
++static const gs_reentry_entry *gs_reentry_tab;
++static int64_t gs_reentry_n;
++
++GS_API void gs_rt_set_reentry(const gs_reentry_entry *table, int64_t n) {
++    gs_reentry_tab = table;
++    gs_reentry_n = n;
++}
++
++/* Called from C on the main program's thread only (gs_on_program_thread),
++   so one buffer serves the reasons. */
++static void *gs_reentry_lookup(const char *name, const char *sig, const char **why) {
++    static char reason[512];
++    for (int64_t i = 0; i < gs_reentry_n; i++) {
++        const gs_reentry_entry *e = &gs_reentry_tab[i];
++        if (strcmp(e->name, name)) continue;
++        if (!e->safe) {
++            snprintf(reason, sizeof reason, "export fn %s uses a var global, so it cannot be called "
++                     "back during a call into C", name);
++            if (why) *why = reason;
++            return NULL;
++        }
++        if (strcmp(e->sig, sig)) {
++            snprintf(reason, sizeof reason, "export fn %s is (%s), not (%s)", name, e->sig, sig);
++            if (why) *why = reason;
++            return NULL;
++        }
++        return (void *)e->fn;
++    }
++    snprintf(reason, sizeof reason, "the program has no export fn %s", name);
++    if (why) *why = reason;
++    return NULL;
++}
++
++
+ GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line) {
+     gs_failf(file, line, "index %lld out of bounds (length %lld)", (long long)i, (long long)n);
+ }
+@@ -1313,7 +1391,8 @@ GS_API GS_NORETURN void gs_asfail_u(const char *why, uint64_t v, const char *typ
+ GS_API GS_NORETURN void gs_asfail_f(const char *why, double d, int f32, const char *type,
+                                     const char *file, int line) {
+     uint8_t num[32];
+-    num[f32 ? gs_fmt_f32(num, (float)d) : gs_fmt_f64(num, d)] = 0;
++)GSRT"
++R"GSRT(    num[f32 ? gs_fmt_f32(num, (float)d) : gs_fmt_f64(num, d)] = 0;
+     gs_asfail(why, (const char *)num, type, file, line);
+ }
+ 
+@@ -1337,6 +1416,16 @@ static char **gs_argv;
+ static size_t gs_region_usable, gs_region_gap, gs_region_reserve, gs_region_page;
+ /* The worker running on this thread, main's being -1 (runtime_threads.h). */
+ static GS_TLS int64_t gs_current_thread_id = -1;
++
++/* Whether the calling thread runs the main program, whose stacks the export
++   wrappers use (gs_rt_hooks). */
++static int gs_on_program_thread(void) { return gs_current_thread_id < 0; }
++
++GS_API void gs_rt_give_hooks(void (*hook)(const gs_rt_hooks *)) {
++    static const gs_rt_hooks hooks = { 2, gs_abort_msg, gs_at_end, gs_reentry_lookup,
++                                       gs_on_program_thread };
++    hook(&hooks);
++}
+ /* The program's address space budget for regions and the most regions its
+    main program and any one worker can hold, as gs_rt_start was told, and
+    the workers that leaves room for: what hardware_threads() reports at
+@@ -1346,8 +1435,7 @@ static int64_t gs_mainregions, gs_workerregions;
+ static int64_t gs_thread_cap = INT64_MAX;
+ 
+ /* A region's own sizes travel with it: those reserved before a refusal
+-)GSRT"
+-R"GSRT(   halved the size are larger than those after. */
++   halved the size are larger than those after. */
+ typedef struct {
+     uint8_t *base;
+     size_t usable, size;    /* size: with the guard gap */
+@@ -1494,7 +1582,8 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
+                     "goose runtime error: out of memory committing a data stack\n";
+                 DWORD written;
+                 WriteFile(GetStdHandle(STD_ERROR_HANDLE), nomem, sizeof(nomem) - 1, &written,
+-                          NULL);
++)GSRT"
++R"GSRT(                          NULL);
+                 ExitProcess(1);
+             }
+             char msg[GS_OVERFLOW_TEXT];
+@@ -1561,8 +1650,7 @@ static GS_NORETURN void gs_park(void) {
+ 
+ #include <sys/mman.h>
+ #include <unistd.h>
+-)GSRT"
+-R"GSRT(#include <signal.h>
++#include <signal.h>
+ #include <pthread.h>
+ 
+ /* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
+@@ -1695,7 +1783,8 @@ static void gs_native_stack_init(void) {
+         void *base;
+         size_t size;
+         if (!pthread_getattr_np(pthread_self(), &attr)) {
+-            if (!pthread_attr_getstack(&attr, &base, &size)) {
++)GSRT"
++R"GSRT(            if (!pthread_attr_getstack(&attr, &base, &size)) {
+                 lo = (uintptr_t)base;
+                 hi = lo + size;
+             }
+@@ -1757,8 +1846,7 @@ static void gs_release_region(const gs_region *r) {
+     if (munmap(r->base, r->size)) gs_panic("cannot release data stack address space");
+ }
+ 
+-)GSRT"
+-R"GSRT(/* Whether this is the first call of gs_end; and where the later ones wait.
++/* Whether this is the first call of gs_end; and where the later ones wait.
+    TinyCC names the memory orders in its stdatomic.h alone. */
+ #ifndef __ATOMIC_SEQ_CST
+ #define __ATOMIC_SEQ_CST 5
+@@ -1775,6 +1863,7 @@ static GS_NORETURN void gs_park(void) {
+ 
+ static GS_NORETURN void gs_end(int code) {
+     if (!gs_end_first()) gs_park();
++    gs_rt_end_hooks();
+     fflush(NULL);
+     #ifdef __TINYC__
+         if (gs_current_thread_id < 0) exit(code);
+@@ -1888,7 +1977,8 @@ GS_API uint8_t gs_trim_memory(void) {
+ #else
+         /* Linux walks only the page tables that were ever populated, so the
+            untouched rest of the reservation costs it little. */
+-        if (madvise((void *)start, len, MADV_DONTNEED)) ok = 0;
++)GSRT"
++R"GSRT(        if (madvise((void *)start, len, MADV_DONTNEED)) ok = 0;
+ #endif
+     }
+     return (uint8_t)ok;
+@@ -1935,8 +2025,7 @@ typedef struct {
+ #define GS_SPLEAF(p, i) ((gs_spleaf *)((p)->base + (i) * GS_SPAN_NODE))
+ #define GS_SPINNER(p, i) ((gs_spinner *)((p)->base + (i) * GS_SPAN_NODE))
+ 
+-)GSRT"
+-R"GSRT(static int64_t gs_sp_newnode(gs_sppath *p) {
++static int64_t gs_sp_newnode(gs_sppath *p) {
+     int64_t i = GS_SPHEAD(p)->chain;
+     if (i) {
+         GS_SPHEAD(p)->chain = GS_SPLEAF(p, i)->link;
+@@ -2106,7 +2195,8 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
+         /* The node keeps its place above, and its new right half goes
+            after it. */
+         gs_sp_fix(p, l, INT64_MAX, 0);
+-        child = nn;
++)GSRT"
++R"GSRT(        child = nn;
+         leaf = 0;
+         k = p->pos[l - 1] + 1;
+         l--;
+@@ -2176,8 +2266,7 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
+ }
+ 
+ /* Takes cnt elements off the front of the span at position k of the path's
+-)GSRT"
+-R"GSRT(   leaf, or the whole span where it holds no more. */
++   leaf, or the whole span where it holds no more. */
+ static void gs_sp_take(gs_sppath *p, int64_t k, int64_t cnt) {
+     gs_spleaf *lf = GS_SPLEAF(p, p->node[p->h]);
+     int64_t c = lf->cnt[k];
+@@ -2336,7 +2425,8 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt)
+         /* The merged count is larger than both it replaces, so one fix
+            covers the span after leaving the leaf as well. */
+         if (next && nl == lf) gs_sp_close(lf, nk);
+-        gs_sp_fix(p, p->h, c, m);
++)GSRT"
++R"GSRT(        gs_sp_fix(p, p->h, c, m);
+         if (next && nl != lf) gs_sp_delete(s->np, nk);
+     } else if (next) {
+         int64_t c = nl->cnt[nk];
+@@ -2399,8 +2489,7 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
+ 
+ /* ---------------------------------------------------------------------------
+    Byte search: std's find_any and find_pair (docs/stdlib.md). A set arrives
+-)GSRT"
+-R"GSRT(   as std's ByteSet, made by its byte_set, which gs_byteset lays out as the
++   as std's ByteSet, made by its byte_set, which gs_byteset lays out as the
+    Goose struct is (spec C.2: packed, in declaration order). `members` is
+    the set. `kind` says how a block of bytes is tested for it: by comparing
+    with 1 to 3 of `bytes` (kinds 1-3), or as the range bytes[0] .. bytes[0] +
+@@ -2542,7 +2631,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
+ #define GS_ANY_LOOP(TEST)                                                              \
+     int64_t i = 0;                                                                     \
+     unsigned k;                                                                        \
+-    for (; i + 16 <= n; i += 16) {                                                     \
++)GSRT"
++R"GSRT(    for (; i + 16 <= n; i += 16) {                                                     \
+         k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + i)));                         \
+         if (k) return i + gs_ctz32(k);                                                 \
+     }                                                                                  \
+@@ -2578,8 +2668,7 @@ static GS_INLINE int64_t gs_scan_any_k(const uint8_t *p, int64_t n, const gs_byt
+     GS_ANY_LOOP(GS_TEST_S)
+ }
+ 
+-)GSRT"
+-R"GSRT(static GS_SSSE3 int64_t gs_scan_any_tables(const uint8_t *p, int64_t n, const gs_byteset *s) {
++static GS_SSSE3 int64_t gs_scan_any_tables(const uint8_t *p, int64_t n, const gs_byteset *s) {
+     gs_bsm ms;
+     gs_bsm_init(&ms, s, 1);
+     GS_ANY_LOOP(GS_TABLES_S)
+@@ -2710,7 +2799,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
+    the digit count first, then the digits from the right, two per division
+    by 100. */
+ static const char gs_digit_pairs[201] =
+-    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
++)GSRT"
++R"GSRT(    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+     "8081828384858687888990919293949596979899";
+ 
+@@ -2769,8 +2859,7 @@ typedef struct { int n; uint32_t d[36]; } gs_big;
+ /* a = v << sh, for v > 0. */
+ static void gs_big_set(gs_big *a, uint64_t v, int sh) {
+     int w = sh >> 5, b = sh & 31, i;
+-)GSRT"
+-R"GSRT(    uint64_t lo = v << b, hi = b ? v >> (64 - b) : 0;
++    uint64_t lo = v << b, hi = b ? v >> (64 - b) : 0;
+     for (i = 0; i < w; i++) a->d[i] = 0;
+     a->d[w] = (uint32_t)lo;
+     a->d[w + 1] = (uint32_t)(lo >> 32);
+@@ -2929,7 +3018,8 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int
+             if (i == x + 1) *p++ = '.';
+             *p++ = i < n ? dig[i] : '0';
+         }
+-        /* A whole number still reads as a float: 1.0, not 1. */
++)GSRT"
++R"GSRT(        /* A whole number still reads as a float: 1.0, not 1. */
+         if (n <= x + 1) {
+             *p++ = '.';
+             *p++ = '0';
+@@ -4235,6 +4325,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      spelling, (unsigned)GetLastError());
+             gs_panic(msg);
+         }
++        void *hooks = (void *)GetProcAddress(h, "goose_runtime_hooks");
+ #else
+         void *h = dlopen(spelling, RTLD_NOW | RTLD_LOCAL);
+         if (!h) {
+@@ -4243,7 +4334,9 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+                      why ? why : "unknown error");
+             gs_panic(msg);
+         }
++        void *hooks = dlsym(h, "goose_runtime_hooks");
+ #endif
++        if (hooks) gs_rt_give_hooks((void (*)(const gs_rt_hooks *))hooks);
+         for (int64_t b = 0; b < nbinds; b++) {
+             if (binds[b].lib != l) continue;
+ #ifdef _WIN32
+@@ -4328,15 +4421,15 @@ GS_API int64_t gs_os_time_ns(void) {
+ }
+ 
+ /* A monotonic clock in nanoseconds, for measuring intervals. */
+-GS_API int64_t gs_os_clock_ns(void) {
++)GSRT"
++R"GSRT(GS_API int64_t gs_os_clock_ns(void) {
+ #ifdef _WIN32
+     LARGE_INTEGER f, c;
+     QueryPerformanceFrequency(&f);
+     QueryPerformanceCounter(&c);
+     return (int64_t)((double)c.QuadPart * (1000000000.0 / (double)f.QuadPart));
+ #else
+-)GSRT"
+-R"GSRT(    struct timespec ts;
++    struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+ #endif
+@@ -4440,6 +4533,22 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+     b.hdr->len += n;
+ }
+ 
++/* The runtime's hooks, which a library that exports
++   `void goose_runtime_hooks(const gs_rt_hooks *)` is handed as the program
++   opens it (spec 7.10): abort_msg ends the program as abort(msg) does, or
++   only the worker in a contained one; at_end has a function called as the
++   program ends. */
++typedef struct {
++    uint32_t version;
++    void (*abort_msg)(const uint8_t *msg, int64_t len, const char *file, int line);
++    void (*at_end)(void (*fn)(void));
++    /* Version 2: the export fn C may call back from a reentrant extern
++       (spec 7.10), by name and signature; and whether this thread runs the
++       main program. */
++    void *(*reentry_lookup)(const char *name, const char *sig, const char **why);
++    int (*on_program_thread)(void);
++} gs_rt_hooks;
++
+ /* Appends `count` elements of `size` bytes each to the T[>..] a typed
+    builder points at (spec 7.10): the bytes are the elements as Goose lays
+    them out, packed, and the header counts elements, not bytes. */

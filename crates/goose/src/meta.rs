@@ -61,7 +61,7 @@ pub struct EnumDef {
     pub goose_size: usize,
     pub same_layout: bool,
     /// `#[goose(align)]`: Goose lays it out as Rust's `#[repr(C, u8)]` with
-    /// `align n` (goose-patches/0007), the payload at `align`; 0 otherwise.
+    /// `align n` (goose-patches/0006), the payload at `align`; 0 otherwise.
     pub align: usize,
     pub variants: Vec<VariantDef>,
 }

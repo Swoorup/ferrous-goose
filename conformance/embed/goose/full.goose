@@ -1,6 +1,6 @@
 // The embed conformance program for a compiler with the Ferrous Goose
 // patches: everything basic.goose has, and exports with several results,
-// builders (goose-patches/0002) and aligned structs (0007).
+// builders (goose-patches/0001) and aligned structs (0006).
 import basic;
 
 struct Config { level: i32, verbose: bool }

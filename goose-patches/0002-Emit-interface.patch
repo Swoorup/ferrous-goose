@@ -1,8 +1,10 @@
-From ae907108a0d87ecd90ac83692e60c160edc63a66 Mon Sep 17 00:00:00 2001
+From bcd481312956ae679ea9bf5979fdd0389b9fa0af Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Mon, 26 Oct 2026 00:34:23 +1100
+Date: Tue, 27 Oct 2026 00:38:28 +1100
 Subject: [PATCH] Describe the native interface as JSON
 
+Expose compiler-resolved exports and reachable layouts for language-neutral
+binding generation and ABI verification through --emit-interface.
 ---
  docs/goose_spec.md |   9 ++
  src/capabilities.h |   2 +-

@@ -272,7 +272,7 @@ impl Gen<'_> {
                     }
                 }
                 GTy::Builder { elem } => {
-                    // The runtime's scratch builder (goose-patches/0002).
+                    // The runtime's scratch builder (goose-patches/0001).
                     builder = true;
                     let t = if matches!(&**elem, GTy::Prim(p) if p == "u8") { "u8".to_string() } else { self.rty(elem)? };
                     let d = format!("__b{i}");

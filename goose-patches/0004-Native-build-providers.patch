@@ -1,8 +1,12 @@
-From 5918d12870adc2b74f6124aaf11241253f4ea891 Mon Sep 17 00:00:00 2001
+From 60cceb3af6263cf0f3afe8002984c9a502cae43d Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Mon, 26 Oct 2026 00:34:25 +1100
+Date: Tue, 27 Oct 2026 00:38:28 +1100
 Subject: [PATCH] Build native libraries through external providers
 
+Accept a versioned library report from an external build command, with
+linker arguments, runtime initialization and optional package combination.
+Support native and JIT links, including archive symbol visibility on ELF
+and response-file handling with MSVC.
 ---
  docs/packages.md   |  37 ++++++++++++++
  src/ast.h          |  10 +++-
@@ -65,10 +69,10 @@ index ffe04508..30444b4e 100644
  repository, as `gfx`, `audio` and `ui` do. A package whose functions keep
  one state for the process, or that may only be called from the main thread,
 diff --git a/src/ast.h b/src/ast.h
-index 403b0eaa..f6739302 100644
+index 5628c2fe..b30fe1ce 100644
 --- a/src/ast.h
 +++ b/src/ast.h
-@@ -2369,8 +2369,16 @@ struct Package {
+@@ -2375,8 +2375,16 @@ struct Package {
      vector<DylibSpelling> dylibs;           // The sidecar's, by name, each once.
      string output;                          // A program's executable, relative to its root.
      vector<int> required;                   // The packages its files require (§4.3), by index.
@@ -126,17 +130,17 @@ index 8f55b6c3..0023b4ba 100644
              argv.push_back(src);
              for (auto &o : objects) argv.push_back(o);
 diff --git a/src/capabilities.h b/src/capabilities.h
-index b4a65e5c..fa473207 100644
+index 8f27d976..6210947f 100644
 --- a/src/capabilities.h
 +++ b/src/capabilities.h
 @@ -2,4 +2,4 @@
  #pragma once
  
  #define GOOSE_NATIVE_ABI 1
--#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks"
-+#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build"
+-#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks reentrant"
++#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build reentrant"
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 021025c7..9255b598 100644
+index 1267dce2..c15be11e 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
 @@ -895,6 +895,20 @@ inline void CodeGen::EmitProgramInit() {
@@ -157,9 +161,9 @@ index 021025c7..9255b598 100644
 +        Append(data, "void ", hook, "(const gs_rt_hooks *);\n");
 +        Append(code, "    gs_rt_give_hooks(", hook, ");\n");
 +    }
+     Append(data, "static void gs_register_reentry(void);\n");
+     Append(code, "    gs_register_reentry();\n");
      // The queues, before anything that could use one runs.
-     vector<string> qnames;
-     for (auto &[m, q] : queues) qnames.push_back(q);
 diff --git a/src/main.cpp b/src/main.cpp
 index 0fd1b18b..705e0086 100644
 --- a/src/main.cpp
@@ -188,7 +192,7 @@ index 0fd1b18b..705e0086 100644
              string s;
              DumpDocs(ast, s);
 diff --git a/src/native.h b/src/native.h
-index 00cdeccf..cc187713 100644
+index a0db140b..29587ff7 100644
 --- a/src/native.h
 +++ b/src/native.h
 @@ -18,6 +18,8 @@ inline vector<int> NativePackagesUsed(const Ast &ast, const vector<FnSpec *> &us
@@ -200,7 +204,7 @@ index 00cdeccf..cc187713 100644
          if (ast.packages[pkg].HasNative()) needed.insert(pkg);
      }
      // A package's depth is one more than the deepest it requires; deeper
-@@ -471,12 +473,28 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -472,12 +474,28 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
      // is as the command line named the program, and a build that named it
      // another way is the same build.
      auto inputs = p.csources;
@@ -229,7 +233,7 @@ index 00cdeccf..cc187713 100644
      string externtext;
      for (auto &n : externs) Append(externtext, n, "\n");
      // The stamp: what the build was made from, then whether it holds the
-@@ -484,6 +502,10 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -485,6 +503,10 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
      auto made = cat(b.tc.id, "\n", FilesHash(inputs), "\n", Hex8(sidecartext), "\n",
                      Hex8(externtext), "\n", Hex8(GooseHeader()), "\n");
      auto aotstamp = cat(made, "aot\n"), jitstamp = cat(made, "jit\n");
@@ -240,7 +244,7 @@ index 00cdeccf..cc187713 100644
      auto stampfile = cat(dir, "/stamp");
      // Whether the build there serves this one. A CMake package from a path
      // is handed to CMake every time, whose own build is incremental and
-@@ -514,6 +536,61 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
+@@ -515,6 +537,61 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
          if (!b.opts.dryrun) WriteFileIfChanged(stampfile, wantjit ? jitstamp : aotstamp);
          return true;
      }

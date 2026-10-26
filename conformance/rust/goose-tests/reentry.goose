@@ -1,5 +1,5 @@
 // test: needs reentrant
-// Rust calling the program back while it waits (goose-patches/0008): the
+// Rust calling the program back while it waits (goose-patches/0003): the
 // call back starts above every live stack top, may call Rust again, and
 // only export fns that leave the var globals alone can be called back.
 import cf;

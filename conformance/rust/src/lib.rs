@@ -269,7 +269,7 @@ pub fn tagged_area(t: &Tagged) -> f64 {
 }
 
 /// An enum with data Goose lays out as Rust does (#[goose(align)],
-/// goose-patches/0007): lent in place, never converted.
+/// goose-patches/0006): lent in place, never converted.
 #[derive(goose::Flat, Clone, Copy, Debug, PartialEq)]
 #[repr(C, u8)]
 #[goose(align)]
@@ -692,7 +692,7 @@ pub fn on_main() -> bool {
     goose::on_main_thread()
 }
 
-// ---- calling Goose back (goose-patches/0008) ----
+// ---- calling Goose back (goose-patches/0003) ----
 
 goose::callbacks! {
     /// What a node is worth, as the Goose program says.

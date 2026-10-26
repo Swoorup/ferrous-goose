@@ -44,7 +44,7 @@ pub fn flat(input: TokenStream) -> TokenStream {
 }
 
 /// Goose export fns Rust calls back while Goose waits on a call
-/// (goose-patches/0008): `goose::callbacks! { fn on_event(x: i64) -> bool; }`.
+/// (goose-patches/0003): `goose::callbacks! { fn on_event(x: i64) -> bool; }`.
 #[proc_macro]
 pub fn callbacks(input: TokenStream) -> TokenStream {
     callbacks::expand(input.into()).unwrap_or_else(|e| e.to_compile_error()).into()

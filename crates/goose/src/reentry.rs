@@ -1,5 +1,5 @@
 //! Calling the Goose program back from Rust while it waits on a call
-//! (goose-patches/0008).
+//! (goose-patches/0003).
 //!
 //! An exported function that takes `&goose::Reentry` is declared `reentrant`
 //! in the generated module: the Goose code calling it publishes every cached
@@ -41,7 +41,7 @@ pub struct Reentry<'call> {
 
 impl Reentry<'_> {
     /// The token for the call a shim is running. Fails where the runtime
-    /// handed over no way back (a compiler without goose-patches/0008) or
+    /// handed over no way back (a compiler without goose-patches/0003) or
     /// the call came from a worker, whose stacks the export wrappers do not
     /// use.
     #[doc(hidden)]
@@ -49,7 +49,7 @@ impl Reentry<'_> {
         let l = LOOKUP.load(Ordering::Acquire);
         if l.is_null() {
             return Err(BridgeError::Abort(
-                "this function calls the Goose program back, which needs a runtime with reentrant (goose-patches/0008)".into(),
+                "this function calls the Goose program back, which needs a runtime with reentrant (goose-patches/0003)".into(),
             ));
         }
         let t = ON_THREAD.load(Ordering::Acquire);

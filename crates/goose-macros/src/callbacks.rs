@@ -1,5 +1,5 @@
 //! `goose::callbacks!`: Goose export fns Rust calls back while Goose waits
-//! on a call (goose-patches/0008). Each declared signature becomes a
+//! on a call (goose-patches/0003). Each declared signature becomes a
 //! function taking the call's `&goose::Reentry` token, which finds the
 //! export fn by name and Goose signature through the runtime (once) and
 //! calls its C wrapper.

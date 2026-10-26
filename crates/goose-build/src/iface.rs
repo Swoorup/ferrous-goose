@@ -1,6 +1,6 @@
 //! A Goose program's C interface: its export fns and the layouts of the
 //! types they reach. Read from the compiler's `--emit-interface` JSON
-//! (goose-patches/0003), or, with a compiler without it, parsed from the
+//! (goose-patches/0002), or, with a compiler without it, parsed from the
 //! sources for the shapes a stock export takes.
 
 use serde::Deserialize;

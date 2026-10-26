@@ -66,7 +66,7 @@ cargo install --path crates/cargo-goose
 cargo goose run examples/regex/goose/find_emails.goose --manifest-path examples/regex/rust/Cargo.toml
 ```
 
-The toolchain script applies [eight compiler patches](docs/goose-patches.md)
+The toolchain script applies [six compiler patches](docs/goose-patches.md)
 to Goose commit `e76d5c9f7f0a17d83c12a405fbb2513094d03985` and builds
 `.toolchain/goose/build/goose`. Use `--stock` to build that commit without
 patches. `GOOSE_REPO=/path/to/goose` selects a local clone source.
@@ -74,7 +74,9 @@ patches. `GOOSE_REPO=/path/to/goose` selects a local clone source.
 `cargo goose` finds the compiler through `--goose`, `$GOOSE`, a
 `.toolchain/goose/build/goose` above the current directory, or PATH.
 Ordinary bindings support the stock compiler; features that need a patch
-are [listed separately](docs/goose-patches.md).
+are [listed separately](docs/goose-patches.md). The patch guide includes Rust/Goose
+examples, stock-compiler behavior, language changes and
+[runtime costs when features are unused](docs/goose-patches.md#ordinary-goose-code-and-unused-features).
 
 For your own crate, use `crate-type = ["cdylib"]` and mark its API with the
 attributes above. Common commands are:

@@ -15,7 +15,7 @@
 //! ```
 //!
 //! A `./` spelling in a package's sidecar is relative to the package's own
-//! directory with goose-patches/0006; a stock compiler reads it relative to
+//! directory with goose-patches/0005; a stock compiler reads it relative to
 //! the program instead.
 
 use crate::{gen, meta, toolchain, write_if_changed};
@@ -85,7 +85,7 @@ pub fn package(p: &Plan) -> Result<(), String> {
 
     let mut sidecar = String::new();
     let _ = writeln!(sidecar, "// Prebuilt libraries of {} {}, one per platform (cargo goose package).", ci.name, ci.version);
-    let _ = writeln!(sidecar, "// A ./ path is the package's own directory (goose-patches/0006).");
+    let _ = writeln!(sidecar, "// A ./ path is the package's own directory (goose-patches/0005).");
     let mut platforms = Vec::new();
     for (platform, libs) in &built {
         let file = match *platform {

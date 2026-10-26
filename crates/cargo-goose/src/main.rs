@@ -375,7 +375,7 @@ fn cmd_package(a: &Args) -> Result<u8, String> {
     Ok(0)
 }
 
-/// A native-build provider (goose-patches/0005): builds the crate's
+/// A native-build provider (goose-patches/0004): builds the crate's
 /// static and shared libraries, writes the module for linking, and prints
 /// what the compiler needs as JSON.
 fn cmd_native(a: &Args) -> Result<u8, String> {
@@ -413,7 +413,7 @@ fn cmd_native(a: &Args) -> Result<u8, String> {
     Ok(0)
 }
 
-/// The native-build combiner for Rust libraries (goose-patches/0005): an
+/// The native-build combiner for Rust libraries (goose-patches/0004): an
 /// umbrella crate depending on each (`--crate dir[:feature,...]`), built as
 /// one static library, since two Rust static libraries would each define
 /// Rust's own symbols. Prints what the compiler needs as JSON.

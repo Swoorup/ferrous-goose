@@ -1,6 +1,6 @@
 //! Checking a generated module against what the compiler makes of it: the
 //! size of every struct and enum, and every field's offset, as the Goose
-//! compiler lays them out (`--emit-interface`, goose-patches/0003) against
+//! compiler lays them out (`--emit-interface`, goose-patches/0002) against
 //! what rustc said. Catches a declaration that does not mean in Goose what
 //! the bridge assumes it does.
 

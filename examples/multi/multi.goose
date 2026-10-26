@@ -1,5 +1,5 @@
 // Two Rust crates in one program, each the native part of a package of its
-// own (goose-patches/0005): goose run and goose build build both crates and
+// own (goose-patches/0004): goose run and goose build build both crates and
 // link them as one library.
 //   goose run multi.goose      goose build multi.goose
 import rx from "./rx";
