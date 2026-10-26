@@ -1,6 +1,6 @@
-From bcd481312956ae679ea9bf5979fdd0389b9fa0af Mon Sep 17 00:00:00 2001
+From 46cb159d0873ac6e1cb87555704fbdf453e5ed44 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 00:38:28 +1100
+Date: Tue, 27 Oct 2026 01:02:08 +1100
 Subject: [PATCH] Describe the native interface as JSON
 
 Expose compiler-resolved exports and reachable layouts for language-neutral
@@ -10,14 +10,15 @@ binding generation and ABI verification through --emit-interface.
  src/capabilities.h |   2 +-
  src/interface.h    | 221 +++++++++++++++++++++++++++++++++++++++++++++
  src/main.cpp       |  22 ++++-
- 4 files changed, 251 insertions(+), 3 deletions(-)
+ test/run_tests.py  |  18 ++++
+ 5 files changed, 269 insertions(+), 3 deletions(-)
  create mode 100644 src/interface.h
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index b114899a..b0ff6c2c 100644
+index a85ae506..c3ee3240 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
-@@ -3029,6 +3029,15 @@ thread. `--header` requires generated C output and at least one export, and
+@@ -3279,6 +3279,15 @@ thread. `--header` requires generated C output and at least one export, and
  writes declarations and the required packed C type definitions for the
  exported API.
  
@@ -271,7 +272,7 @@ index 00000000..7890a0cf
 +
 +}  // namespace goose
 diff --git a/src/main.cpp b/src/main.cpp
-index 0c3f9b92..0fd1b18b 100644
+index 0af5a75b..47be09ca 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -45,6 +45,7 @@
@@ -282,7 +283,7 @@ index 0c3f9b92..0fd1b18b 100644
  #include "toolchain.h"
  #include "builtin.h"
  #include "build.h"
-@@ -855,6 +856,9 @@ Options:
+@@ -857,6 +858,9 @@ Options:
    --standalone          Write C that holds the whole runtime and builds alone.
    --header out.h        Also write a header for a C host, which supplies main
                          and starts the program through goose_init.
@@ -292,16 +293,16 @@ index 0c3f9b92..0fd1b18b 100644
    --include header.h    Have the C include this header (may be repeated).
    --jit                 Also run the program in this process.
    --emit-runtime out.c  Write the runtime's C.
-@@ -1054,7 +1058,7 @@ int Main(int argc, char **argv) {
-         return 0;
+@@ -1327,7 +1331,7 @@ int Main(int argc, char **argv) {
      }
      if (verb == "lsp") return RunLsp(exe, vector<string>(argv + firstarg, argv + argc));
+     if (verb == "format") return RunFormat(vector<string>(argv + firstarg, argv + argc));
 -    string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile;
 +    string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile, interfacename;
      auto dump = false, dumpdocs = false, tokens = false, parseonly = false, specs = false;
      auto nocgen = false;
      auto roundtrip = false, multitest = false;
-@@ -1155,6 +1159,7 @@ int Main(int argc, char **argv) {
+@@ -1429,6 +1433,7 @@ int Main(int argc, char **argv) {
          else if (arg == "-O2") optlevel = 2;
          else if (arg == "-o" && i + 1 < argc) outname = argv[++i];
          else if (arg == "--header" && i + 1 < argc) headername = argv[++i];
@@ -309,7 +310,7 @@ index 0c3f9b92..0fd1b18b 100644
          else if (arg == "--include" && i + 1 < argc) includenames.push_back(argv[++i]);
          else if (arg == "--stdlib" && i + 1 < argc) stdlibdir = argv[++i];
          else if (arg == "--cc" && i + 1 < argc) ccrequest = argv[++i];
-@@ -1372,7 +1377,7 @@ int Main(int argc, char **argv) {
+@@ -1655,7 +1660,7 @@ int Main(int argc, char **argv) {
          }
          // --stacks needs the generated program's bounds, so --check runs
          // the backend for them and writes nothing.
@@ -318,7 +319,7 @@ index 0c3f9b92..0fd1b18b 100644
          // A quoted include resolves against the including file's own directory
          // first, so the --include headers are written relative to where the .c
          // goes: the generated file then compiles wherever the tree sits,
-@@ -1391,6 +1396,19 @@ int Main(int argc, char **argv) {
+@@ -1674,6 +1679,19 @@ int Main(int argc, char **argv) {
          auto stackcfg = StackConfigOf(cdefines);
          CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
          if (stacks) cg.StackReport(msgs, stackcfg);
@@ -331,10 +332,39 @@ index 0c3f9b92..0fd1b18b 100644
 +            } else {
 +                if (!WriteFileMakingDirs(interfacename, text))
 +                    throw CompileError { cat("cannot write the interface: ", interfacename) };
-+                fprintf(msgs, "wrote %s (%d bytes)\n", interfacename.c_str(), (int)text.size());
++                if (!quiet) fprintf(msgs, "wrote %s (%d bytes)\n", interfacename.c_str(), (int)text.size());
 +            }
 +            if (nocgen) return 0;
 +        }
          // The packages whose native parts the program needs, which a JIT
          // run takes functions from and a build links: its own, when it has
          // one, and every package an extern fn it calls was declared in,
+diff --git a/test/run_tests.py b/test/run_tests.py
+index 9eaaf42b..d587a6ec 100755
+--- a/test/run_tests.py
++++ b/test/run_tests.py
+@@ -2075,6 +2075,24 @@ def main():
+             r2 = subprocess.run(["groff", "-man", "-ww", "-z", str(page)], capture_output=True, text=True)
+             checks.append(("help --man is a man page groff reads without warnings",
+                            r2.returncode == 0 and not r2.stderr, r2.stderr))
++        # Interface JSON remains machine-readable, including in quiet mode.
++        iface_probe = gendir / "verbs_interface.goose"
++        tc.write_text(iface_probe, "export fn answer() -> i64 { return 42; }\n")
++        code, out, err = tc.run_capture([exe, "check", "--emit-interface", "json", iface_probe])
++        try:
++            iface = json.loads(out)
++        except ValueError:
++            iface = {}
++        checks.append(("interface JSON on stdout", code == 0 and
++                       any(e.get("name") == "answer" for e in iface.get("exports", [])), out + err))
++        iface_file = gendir / "verbs_interface.json"
++        code, out, err = tc.run_capture([exe, "check", "-q", "--emit-interface", iface_file, iface_probe])
++        try:
++            iface = json.loads(iface_file.read_text())
++        except (OSError, ValueError):
++            iface = {}
++        checks.append(("interface file honors -q", code == 0 and not out and not err and
++                       any(e.get("name") == "answer" for e in iface.get("exports", [])), out + err))
+         # Less than a page or two of data stack is no reservation to run on.
+         code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
+         checks.append(("check --stack-reserve 5000 (refused)",

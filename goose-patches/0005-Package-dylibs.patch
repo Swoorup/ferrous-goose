@@ -1,36 +1,35 @@
-From 3779c77ac32e7ca57d105626c4df448edf4708da Mon Sep 17 00:00:00 2001
+From d9ced9ac7ee0ebf99f2b3c77c5b91d09decbaae4 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 00:38:28 +1100
+Date: Tue, 27 Oct 2026 01:03:39 +1100
 Subject: [PATCH] Resolve package libraries relative to their package
 
 Resolve package-local shared libraries and platform/architecture overrides
 so prebuilt native dependencies can be distributed with their Goose module.
 ---
- docs/packages.md   |  9 ++++++++-
+ docs/packages.md   |  8 ++++++++
  src/capabilities.h |  2 +-
  src/packages.h     | 31 +++++++++++++++++++++++++++++++
- 3 files changed, 40 insertions(+), 2 deletions(-)
+ 3 files changed, 40 insertions(+), 1 deletion(-)
 
 diff --git a/docs/packages.md b/docs/packages.md
-index 30444b4e..0e62ac3b 100644
+index 54f282a1..befa422d 100644
 --- a/docs/packages.md
 +++ b/docs/packages.md
-@@ -171,7 +171,14 @@ the platform suffixes, maps a name a block uses to the spelling to open
- where the derived one is wrong, `dylibs_linux = ["SDL2=libSDL2-2.0.so.0"];`.
- A package maps its own names as defaults; the program's sidecar maps a
- name for any package it uses and wins, platform by platform, for the
--names it mentions; a name no block declares is an error. A program
-+names it mentions; a name no block declares is an error. A spelling
-+starting with `./` in a package's sidecar is a file the package ships,
-+from its own root, so a package can carry a prebuilt library for each
-+platform: `dylibs_macos = ["mylib=./lib/macos/libmylib.dylib"];`. A
-+`dylibs_<platform>_x86_64` or `dylibs_<platform>_arm64` list maps a name for
-+one architecture of the platform, over the platform's list where the
-+compiler runs on that architecture: `dylibs_linux_arm64 =
-+["mylib=./lib/linux-arm64/libmylib.so"];`. A program
- calling only such functions builds and links nothing, and runs under
- `goose run` with no C toolchain installed. The rest of this section is
- about C the package compiles itself.
+@@ -197,6 +197,14 @@ If the name produces the wrong library filename, map it in the sidecar's
+ program's sidecar can override any of those names, with precedence determined
+ separately for each platform. Mapping a name that no block declares is an error.
+ 
++A spelling starting with `./` in a package's sidecar resolves from that
++package's root, so it can carry its own prebuilt libraries. For example,
++`dylibs_macos = ["mylib=./lib/macos/libmylib.dylib"];` loads the file shipped
++under the package's `lib/` directory. An architecture-specific list such as
++`dylibs_linux_arm64 = ["mylib=./lib/linux-arm64/libmylib.so"];` overrides the
++platform's list for that architecture. The supported suffixes are
++`_x86_64` and `_arm64`.
++
+ A program that calls only these functions compiles and links no native code and
+ can run with `goose run` without a C toolchain. The rest of this section covers
+ packages that compile their own C.
 diff --git a/src/capabilities.h b/src/capabilities.h
 index 6210947f..965ae729 100644
 --- a/src/capabilities.h

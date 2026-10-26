@@ -67,9 +67,10 @@ cargo goose run examples/regex/goose/find_emails.goose --manifest-path examples/
 ```
 
 The toolchain script applies [six compiler patches](docs/goose-patches.md)
-to Goose commit `e76d5c9f7f0a17d83c12a405fbb2513094d03985` and builds
+to Goose commit `a108677d300cb0e8bbb842c35a353abe67a20c6c` and builds
 `.toolchain/goose/build/goose`. Use `--stock` to build that commit without
-patches. `GOOSE_REPO=/path/to/goose` selects a local clone source.
+patches. This pin is upstream `master` as fetched on 2026-10-27;
+`GOOSE_REPO=/path/to/goose` selects a local clone source.
 
 `cargo goose` finds the compiler through `--goose`, `$GOOSE`, a
 `.toolchain/goose/build/goose` above the current directory, or PATH.

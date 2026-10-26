@@ -1,6 +1,6 @@
-From 16e266ca656892b495e48525dc70f120def0e0a1 Mon Sep 17 00:00:00 2001
+From 3eb039ffd9140a1dbf8c96d5d7576f64badb6e40 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 00:38:28 +1100
+Date: Tue, 27 Oct 2026 01:04:45 +1100
 Subject: [PATCH] Support explicit alignment for structs and enums
 
 Preserve declared alignment in variables, arrays and runtime data stacks.
@@ -15,17 +15,20 @@ Validate layouts and report alignment through the native interface metadata.
  src/codegen_stmts.h     |  1 +
  src/codegen_types.h     | 75 ++++++++++++++++++++++++++++++++++++++---
  src/codegen_values.h    |  1 +
+ src/dump.h              |  2 ++
  src/interface.h         |  5 +--
  src/parser.h            | 36 ++++++++++++++++++--
  src/runtime/runtime.h   |  9 +++++
- src/runtime_inline.h    | 21 ++++++++----
- 13 files changed, 167 insertions(+), 16 deletions(-)
+ src/runtime_inline.h    | 19 ++++++++---
+ test/format.py          |  3 ++
+ test/run_tests.py       | 10 ++++++
+ 16 files changed, 181 insertions(+), 15 deletions(-)
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index 0f2ed1f9..a79dc2be 100644
+index 114bb8bd..8e48514c 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
-@@ -265,6 +265,19 @@ struct X { a: i8[3], b: i32, c: i64 = 0 }
+@@ -268,6 +268,19 @@ struct X { a: i8[3], b: i32, c: i64 = 0 }
    tail padding is added. In variable-class layouts (where offsets are dynamic)
    `pad n` still inserts n bytes, but bare `pad` has no defined alignment to
    aim for and inserts nothing.
@@ -46,7 +49,7 @@ index 0f2ed1f9..a79dc2be 100644
    is not assigned after construction (§4.4), and `const f: T` is `let f:
    const T`: its contents are read-only too (§9.5).
 diff --git a/src/ast.h b/src/ast.h
-index b30fe1ce..8d5d1819 100644
+index d00183df..3f18c5c7 100644
 --- a/src/ast.h
 +++ b/src/ast.h
 @@ -1502,6 +1502,10 @@ struct SStruct {
@@ -115,10 +118,10 @@ index 994ef40d..9403c68f 100644
                  L(flv, ".len = 0;");
                  GenConstruct(init, stk, ft, cat(flv, ".len"));
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index c15be11e..d5a3e385 100644
+index 1fa1b2a9..3482e71e 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
-@@ -851,6 +851,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
+@@ -855,6 +855,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
      if (IsResz(d->type) && IsFrameObj(d->type)) {
          // The tail header is set when the value is constructed.
      } else if (IsResz(d->type)) {
@@ -283,6 +286,26 @@ index 9dfa43c8..87ac3ab5 100644
          L("gs_rhdr ", h, " = { ", Top(stk), ", 0 };");
          SaveBase(false, stk, cat(h, ".base"));
      }
+diff --git a/src/dump.h b/src/dump.h
+index 59fea177..25fe128f 100644
+--- a/src/dump.h
++++ b/src/dump.h
+@@ -686,6 +686,7 @@ inline void StructDecl::Dump(string &s, int ind) const {
+     Append(s, "struct ", st->qname);
+     DumpGenerics(s, st->generics);
+     s += " {";
++    if (st->align > 1) { NL(s, ind + 1); Append(s, "align ", st->align, ","); }
+     DumpFields(s, st->fields, ind);
+     NL(s, ind);
+     s += "}";
+@@ -695,6 +696,7 @@ inline void EnumDecl::Dump(string &s, int ind) const {
+     Append(s, "enum ", en->qname);
+     DumpGenerics(s, en->generics);
+     s += " {";
++    if (en->align > 1) { NL(s, ind + 1); Append(s, "align ", en->align, ","); }
+     for (auto &v : en->variants) {
+         NL(s, ind + 1);
+         s += v.name;
 diff --git a/src/interface.h b/src/interface.h
 index 7890a0cf..899b5886 100644
 --- a/src/interface.h
@@ -307,19 +330,19 @@ index 7890a0cf..899b5886 100644
                  if (vi) out += ",";
                  auto &v = ei->en->variants[vi];
 diff --git a/src/parser.h b/src/parser.h
-index a1f5ce4f..3c5b066b 100644
+index 1852b14e..337385d4 100644
 --- a/src/parser.h
 +++ b/src/parser.h
-@@ -533,7 +533,7 @@ struct Parser {
-         ParseMembers(st->broken, depth, startp, [&](Ast::DeclMark &kept) {
+@@ -561,7 +561,7 @@ struct Parser {
              ParseGenerics(st->generics, &kept);
+             if (lex.tok == T_LCURLY) Role(R_LIST);
              Expect(T_LCURLY, "struct declaration");
 -            ParseFieldList(st->fields, "struct body", &kept);
 +            ParseFieldList(st->fields, "struct body", &kept, &st->align);
              Expect(T_RCURLY, "struct declaration");
          });
          st->end = PrevEnd();
-@@ -542,10 +542,37 @@ struct Parser {
+@@ -570,10 +570,37 @@ struct Parser {
          ast.topdecls.push_back(Finish(New<StructDecl>(line, st)));
      }
  
@@ -358,8 +381,8 @@ index a1f5ce4f..3c5b066b 100644
              Field f;
              f.line = CurLine();
              f.doc = lex.doc;
-@@ -594,6 +621,11 @@ struct Parser {
-             ParseGenerics(en->generics, &kept);
+@@ -623,6 +650,11 @@ struct Parser {
+             if (lex.tok == T_LCURLY) Role(R_LIST);
              Expect(T_LCURLY, "enum declaration");
              while (lex.tok != T_RCURLY) {
 +                if (ParseAlign(&en->align, "enum")) {
@@ -371,10 +394,10 @@ index a1f5ce4f..3c5b066b 100644
                  v.line = CurLine();
                  v.doc = lex.doc;
 diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
-index ab0f08c0..4bd09c4f 100644
+index b89de539..351fb086 100644
 --- a/src/runtime/runtime.h
 +++ b/src/runtime/runtime.h
-@@ -845,6 +845,15 @@ typedef struct {
+@@ -873,6 +873,15 @@ typedef struct {
     gets nothing more. */
  #define GOOSE_H 1
  
@@ -391,10 +414,10 @@ index ab0f08c0..4bd09c4f 100644
     region's usable reservation and trailing guard gap, the address space
     budgeted for regions over the whole program, and the most regions the
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index e4686c79..9d69273c 100644
+index ce887f28..35d013a7 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
-@@ -861,6 +861,15 @@ typedef struct {
+@@ -889,12 +889,21 @@ typedef struct {
     gets nothing more. */
  #define GOOSE_H 1
  
@@ -405,48 +428,71 @@ index e4686c79..9d69273c 100644
 +#else
 +#define GS_ALIGNED(n) __attribute__((aligned(n)))
 +#endif
-+#define GS_ALIGN_UP(p, n) ((uint8_t *)(((uintptr_t)(p) + ((uintptr_t)(n) - 1)) & ~((uintptr_t)(n) - 1)))
++)GSRT"
++R"GSRT(#define GS_ALIGN_UP(p, n) ((uint8_t *)(((uintptr_t)(p) + ((uintptr_t)(n) - 1)) & ~((uintptr_t)(n) - 1)))
 +
  /* Starts the runtime on main's thread: the program's arguments, each
     region's usable reservation and trailing guard gap, the address space
     budgeted for regions over the whole program, and the most regions the
-@@ -880,7 +889,8 @@ GS_API void gs_release_regions(void);
- /* ---------------------------------------------------------------------------
-    Dynamic externs (§7.10): the shared libraries the program's extern blocks
-    name, and the functions it calls through them, bound by name as the
--   program starts (docs/design/dynamic_externs.md). */
-+)GSRT"
-+R"GSRT(   program starts (docs/design/dynamic_externs.md). */
- 
- /* A library: the name its block gives and, where the sidecar spells it for
-    a platform, that spelling; NULL where the platform derives its own
-@@ -888,8 +898,7 @@ GS_API void gs_release_regions(void);
- typedef struct gs_dllib {
-     const char *name, *onwindows, *onmacos, *onlinux;
- } gs_dllib;
+    main program and any one worker hold (the compiler's static counts),
 -)GSRT"
--R"GSRT(/* One function: its library's index in the table, the symbol the library
-+/* One function: its library's index in the table, the symbol the library
-    is asked for, and the pointer the generated code calls through. */
- typedef struct gs_dlbind {
-     int32_t lib;
-@@ -1066,7 +1075,8 @@ static int64_t gs_uleb_size(const uint8_t *p) {
-    which the emitting sites already assume (they form the element address
-    from the same text). A varint *value*, by contrast, is whatever the
-    program stored, so scalar fields and relative offsets keep the loop above
--   inline, where the compilers peel the first byte themselves. */
+-R"GSRT(   which size their registries and give hardware_threads() its cap. */
++   which size their registries and give hardware_threads() its cap. */
+ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
+                         uint64_t budget, int64_t mainregions, int64_t workerregions);
+ /* A fresh region, registered to the calling thread program. */
+@@ -1062,7 +1071,8 @@ GS_API int64_t gs_spans_alloc(uint8_t *base, int64_t *n, uint8_t **top, int64_t
+    the elements where that moved. */
+ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t len,
+                                int64_t idx, int64_t ol, int64_t cnt);
+-/* free_slice, and what realloc_slice lets go of: [idx, idx + cnt) back on
 +)GSRT"
-+R"GSRT(   inline, where the compilers peel the first byte themselves. */
++R"GSRT(/* free_slice, and what realloc_slice lets go of: [idx, idx + cnt) back on
+    the freelist. */
+ GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx, int64_t cnt);
  
- static GS_NOINLINE int64_t gs_uleb_read_slow(const uint8_t *p) {
-     return gs_uleb_read(p);
-@@ -1077,8 +1087,7 @@ static GS_NOINLINE int64_t gs_uleb_size_slow(const uint8_t *p) {
- }
- 
- #define GS_ULEB_READ(p) ((*(p) & 0x80) ? gs_uleb_read_slow(p) : (int64_t)*(p))
+@@ -1072,8 +1082,7 @@ GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx,
+ static int64_t gs_uleb_read(const uint8_t *p) {
+     uint64_t v = 0;
+     int shift = 0;
 -)GSRT"
--R"GSRT(#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
-+#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
+-R"GSRT(    for (;;) {
++    for (;;) {
+         uint8_t b = *p++;
+         v |= (uint64_t)(b & 0x7f) << shift;
+         if (!(b & 0x80)) return (int64_t)v;
+diff --git a/test/format.py b/test/format.py
+index 46116e78..d93ae892 100644
+--- a/test/format.py
++++ b/test/format.py
+@@ -17,6 +17,9 @@ from doc_comments import SOURCE as DOC_SOURCE
  
- static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
-     uint8_t *q = p;
+ # (name, input, expected output)
+ GOLDEN = [
++    ("aligned native layouts",
++     "struct Point{align 8,x:f64,y:f64}\nenum Shape{align 8,Circle{r:f64},Dot}\n",
++     "struct Point { align 8, x: f64, y: f64 }\nenum Shape { align 8, Circle { r: f64 }, Dot }\n"),
+     ("reentrant externs",
+      'extern reentrant fn visit(x:i64)->i64;\nextern "lib"{reentrant fn callback();}\n',
+      'extern reentrant fn visit(x: i64) -> i64;\nextern "lib" { reentrant fn callback(); }\n'),
+diff --git a/test/run_tests.py b/test/run_tests.py
+index 09db60d9..1b036aee 100755
+--- a/test/run_tests.py
++++ b/test/run_tests.py
+@@ -2101,6 +2101,16 @@ def main():
+         checks.append(("dump preserves reentrant externs", code == 0 and
+                        "extern reentrant fn visit" in out and "reentrant fn callback" in out,
+                        out + err))
++        # A normalized source dump must retain both declared alignments.
++        align_probe = gendir / "verbs_aligned.goose"
++        tc.write_text(align_probe, "struct Point { align 8, x: f64, y: f64 }\n"
++                      "enum Shape { align 8, Circle { r: f64 }, Dot }\nfn main() {}\n")
++        code, out, err = tc.run_capture([exe, "--parse", "--dump", align_probe])
++        checks.append(("dump preserves alignment", code == 0 and out.count("align 8,") == 2,
++                       out + err))
++        code, out, err = tc.run_capture([exe, "check", "--roundtrip", align_probe])
++        checks.append(("aligned source roundtrips", code == 0 and "roundtrip ok" in out + err,
++                       out + err))
+         # Less than a page or two of data stack is no reservation to run on.
+         code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
+         checks.append(("check --stack-reserve 5000 (refused)",

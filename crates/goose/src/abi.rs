@@ -105,4 +105,4 @@ pub const METADATA_FORMAT: u32 = 2;
 
 /// The Goose runtime whose layouts this bridge was written against (what
 /// `goose version` prints). `cargo goose` compares it with the compiler's.
-pub const GOOSE_RUNTIME: &str = "a5dbd11b6309";
+pub const GOOSE_RUNTIME: &str = "fba599d313fe";

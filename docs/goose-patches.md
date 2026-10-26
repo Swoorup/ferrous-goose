@@ -1,7 +1,9 @@
 # Goose compiler patches
 
 The six patches in [goose-patches/](../goose-patches/) apply in order to
-Goose commit `e76d5c9f7f0a17d83c12a405fbb2513094d03985`.
+Goose commit [`a108677d300cb0e8bbb842c35a353abe67a20c6c`](https://github.com/aardappel/goose/commit/a108677d300cb0e8bbb842c35a353abe67a20c6c),
+the upstream `master` head fetched on 2026-10-27. Builds remain pinned to
+that exact revision so local and CI results are reproducible.
 `scripts/toolchain.sh` builds the result at `.toolchain/goose/build/goose`;
 `--stock` builds the pinned commit without patches. “Stock” below means
 that pinned revision.
@@ -27,10 +29,14 @@ already support typed builders and multiple results.
 | [0005 — Package libraries](../goose-patches/0005-Package-dylibs.patch) | `package-dylibs` | Locate prebuilt libraries relative to their package, with platform/architecture overrides. |
 | [0006 — Alignment](../goose-patches/0006-Alignment.patch) | `align` | Preserve explicit struct/enum alignment throughout Goose storage. |
 
-The series was consolidated from eight patches. The final compiler source
-is unchanged apart from removing an obsolete patch-number comment. The
-builder helper in the embedded runtime now belongs to the first patch,
-so it is available alongside the public-header helper.
+The series was consolidated from eight patches at the previous upstream
+pin, `e76d5c9f7f0a17d83c12a405fbb2513094d03985`. That reorganization
+preserved compiler behavior. The six patches have since been rebased onto
+the current pin above, retaining upstream's formatter, help, completion,
+version reporting and runtime changes. The interface flag honors quiet
+mode, and source dumps preserve `reentrant` and `align` declarations.
+The builder helper in the embedded runtime belongs to the first patch,
+alongside the public-header helper.
 
 | Previous patch numbers | Current patch |
 |---|---|
@@ -51,7 +57,7 @@ Patch numbers identify files; capability names identify behavior. The
 compiler still reports eight capabilities, in the same order as before:
 
 ```text
-goose runtime <runtime-hash>
+goose <compiler-version> (runtime <runtime-hash>)
 features: typed-builders export-results emit-interface runtime-hooks native-build package-dylibs align reentrant
 native-abi: 1
 ```
@@ -60,7 +66,9 @@ native-abi: 1
 The runtime-hook API is version 2. Neither is the Rust metadata format
 (currently 2). Feature support alone does not establish ABI compatibility.
 
-`cargo goose` and `goose_build` read these capabilities. Ordinary bindings
+`cargo goose` accepts both upstream's current version line and the earlier
+`goose runtime <runtime-hash>` form. `cargo goose` and `goose_build` read the
+capability lines independently of the compiler version. Ordinary bindings
 retain stock-compiler fallbacks. Functions that require unavailable
 features are omitted with an explanatory comment. Strict
 `#[goose::export(zero_copy)]` uses the existing capabilities; it does not
@@ -195,7 +203,9 @@ supports. It cannot request the compiler's layout JSON.
 The description includes types, sizes, field offsets, padding and alignment.
 Binding tools use it to generate wrappers and verify memory compatibility.
 It adds no runtime reflection or per-call lookup. Without the flag, no
-interface JSON is produced. Strict Rust exports require this verification.
+interface JSON is produced. `-q` suppresses the file-written notice;
+explicit JSON output on stdout remains available. Strict Rust exports
+require this verification.
 
 ## 0003: Runtime hooks and re-entry
 
@@ -283,8 +293,9 @@ checks callback eligibility; Rust caches successful lookups and checks the
 program thread when creating a re-entry token. These costs remain even
 with strict zero-copy bindings.
 
-Callbacks require the program thread and cannot access mutable `var`
-globals, including through callees. Rust exports taking `Reentry` cannot
+The formatter and source dump retain the `reentrant` modifier. Callbacks
+require the program thread and cannot access mutable `var` globals,
+including through callees. Rust exports taking `Reentry` cannot
 also take explicit builders or closure callbacks. The token is supplied by
 the shim, not by a Goose argument.
 
@@ -449,7 +460,8 @@ and fix the upper tag bytes after mutation.
 This is a language feature: it also affects pure Goose code that uses
 `align`, even without native bindings. Unannotated types retain their
 default layouts. Alignment alone does not establish layout compatibility;
-interface verification and runtime value checks remain necessary.
+interface verification and runtime value checks remain necessary. Formatting
+and source dumps preserve the alignment declarations.
 
 ## Ordinary Goose code and unused features
 

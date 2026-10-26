@@ -1,6 +1,6 @@
-From a8ed8318ff809f2a59c4dfaf17c576a50f3c2ee3 Mon Sep 17 00:00:00 2001
+From bd65764880a614ca37f5c5671d902d7f62ef28e4 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 00:38:28 +1100
+Date: Tue, 27 Oct 2026 01:02:49 +1100
 Subject: [PATCH] Provide runtime hooks and reentrant native callbacks
 
 Provide native libraries with versioned abort, shutdown and callback hooks.
@@ -8,29 +8,31 @@ Publish live stack tops for reentrant calls and expose eligible exports by
 name and signature, restricting callbacks to the program thread and exports
 that do not access mutable globals.
 ---
- docs/goose_spec.md         |  23 +++-
+ docs/goose_spec.md         |  23 +++++
  src/ast.h                  |   6 ++
  src/capabilities.h         |   2 +-
  src/codegen.h              |   1 +
  src/codegen_emit.h         |  71 ++++++++++++-
+ src/dump.h                 |   1 +
  src/native.h               |   1 +
  src/parser.h               |   8 +-
  src/runtime/goose.h        |  16 +++
  src/runtime/runtime.h      |  33 +++++-
  src/runtime/runtime_impl.h |  66 +++++++++++-
  src/runtime/runtime_os.h   |   3 +
- src/runtime_inline.h       | 209 ++++++++++++++++++++++++++++---------
- 12 files changed, 380 insertions(+), 59 deletions(-)
+ src/runtime_inline.h       | 205 ++++++++++++++++++++++++++++---------
+ test/format.py             |   3 +
+ test/run_tests.py          |   8 ++
+ 15 files changed, 391 insertions(+), 56 deletions(-)
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index b0ff6c2c..0f2ed1f9 100644
+index c3ee3240..114bb8bd 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
-@@ -2971,7 +2971,28 @@ cannot load SDL2 (libSDL2.so): libSDL2.so: cannot open shared object file: No su
+@@ -3220,6 +3220,29 @@ cannot load SDL2 (libSDL2.so): libSDL2.so: cannot open shared object file: No su
  SDL2 (libSDL2.so) has no symbol SDL_Foo
  ```
  
--A library is never closed. A `main_thread_only` package (docs/packages.md)
 +**Calls back.** `reentrant` before an extern's `fn` (`extern reentrant fn
 +walk(t: Tree);`, or `reentrant fn walk(t: Tree);` in a block) says its C may
 +call the program's export fns back while it runs. Each caller, and theirs,
@@ -52,12 +54,13 @@ index b0ff6c2c..0f2ed1f9 100644
 +`at_end(fn)`, which has the runtime call `fn` when the program ends, by a
 +return from `main` or by `exit`; and, from version 2, `reentry_lookup(name,
 +sig, &why)`, the wrapper of an export fn a call back may reach, and
-+`on_program_thread()`. A library never sees a hook it did not ask for. A library is never closed. A `main_thread_only` package (docs/packages.md)
- applies to its block's members as to its other externs. A variadic C
- function cannot be bound: the declaration has no way to say so, and
- calling one through a fixed-arity pointer is undefined. The generated C is
++`on_program_thread()`. A library never sees a hook it did not ask for.
++
+ A library is never closed. A package's `main_thread_only` restriction
+ (docs/packages.md) applies to the members of its blocks as it does to its
+ other externs. A variadic C function cannot be bound: the declaration has
 diff --git a/src/ast.h b/src/ast.h
-index 403b0eaa..5628c2fe 100644
+index d6cbd5d8..d0e0de29 100644
 --- a/src/ast.h
 +++ b/src/ast.h
 @@ -1468,6 +1468,12 @@ struct SFunction {
@@ -96,10 +99,10 @@ index 26dd84eb..14d7aeba 100644
      void EmitMain();
  
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 26773948..1267dce2 100644
+index c046754f..9c09add8 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
-@@ -895,6 +895,8 @@ inline void CodeGen::EmitProgramInit() {
+@@ -899,6 +899,8 @@ inline void CodeGen::EmitProgramInit() {
      if (!dllibs.empty())
          Append(code, "    gs_dl_bind(gs_dllibs, ", dllibs.size(), ", gs_dlbinds, ", dlbinds,
                 ");\n");
@@ -108,7 +111,7 @@ index 26773948..1267dce2 100644
      // The queues, before anything that could use one runs.
      vector<string> qnames;
      for (auto &[m, q] : queues) qnames.push_back(q);
-@@ -1057,6 +1059,73 @@ inline void CodeGen::EmitExports() {
+@@ -1061,6 +1063,73 @@ inline void CodeGen::EmitExports() {
          }
          Append(code, "}\n\n");
      }
@@ -182,7 +185,7 @@ index 26773948..1267dce2 100644
  }
  
  inline string CodeGen::ExportHeader() {
-@@ -1074,7 +1143,7 @@ inline string CodeGen::ExportHeader() {
+@@ -1078,7 +1147,7 @@ inline string CodeGen::ExportHeader() {
  
  inline void CodeGen::EmitMain() {
      Append(code, "int main(int argc, char **argv) {\n    gs_program_init(argc, argv);\n",
@@ -191,6 +194,18 @@ index 26773948..1267dce2 100644
  }
  
  }  // namespace goose
+diff --git a/src/dump.h b/src/dump.h
+index 5ca3ee17..59fea177 100644
+--- a/src/dump.h
++++ b/src/dump.h
+@@ -650,6 +650,7 @@ inline void FnDecl::Dump(string &s, int ind) const {
+     if (sf->issimd) s += "simd ";
+     if (sf->isinline) s += "inline ";
+     if (sf->isrec) s += "recursive ";
++    if (sf->reentrant) s += "reentrant ";
+     s += sf->isthread ? "thread_fn " : "fn ";
+     s += sf->isnested ? sf->name : sf->qname;   // See VarDecl::Dump.
+     DumpGenerics(s, sf->generics);
 diff --git a/src/native.h b/src/native.h
 index 00cdeccf..a0db140b 100644
 --- a/src/native.h
@@ -204,10 +219,10 @@ index 00cdeccf..a0db140b 100644
          lex.Next();
          if (lex.tok == T_IDENT) {
 diff --git a/src/parser.h b/src/parser.h
-index 25400ee2..a1f5ce4f 100644
+index 17fd8f0c..1852b14e 100644
 --- a/src/parser.h
 +++ b/src/parser.h
-@@ -742,6 +742,12 @@ struct Parser {
+@@ -773,6 +773,12 @@ struct Parser {
          }
          sf->isrec = IsNext(T_RECURSIVE);
          if (sf->isinline && sf->isrec) Error("recursive fn cannot be inline");
@@ -220,7 +235,7 @@ index 25400ee2..a1f5ce4f 100644
          if (lex.tok == T_THREADFN) {
              if (sf->isinline) Error("thread_fn cannot be inline");
              sf->isthread = true;
-@@ -821,7 +827,7 @@ struct Parser {
+@@ -853,7 +859,7 @@ struct Parser {
                  if (sf->cname.empty()) sf->cname = string(sf->name);
                  // The runtime entry points that read every stack top through
                  // the registry rather than through their arguments.
@@ -257,10 +272,10 @@ index 3819ad62..637fee90 100644
     builder points at (spec 7.10): the bytes are the elements as Goose lays
     them out, packed, and the header counts elements, not bytes. */
 diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
-index 596ef768..ab0f08c0 100644
+index 97eaaa40..b89de539 100644
 --- a/src/runtime/runtime.h
 +++ b/src/runtime/runtime.h
-@@ -181,6 +181,34 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
+@@ -191,6 +191,34 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
  GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
                                       int line);
  GS_API GS_NORETURN void gs_exit(int64_t code);
@@ -295,7 +310,7 @@ index 596ef768..ab0f08c0 100644
  GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line);
  GS_API GS_NORETURN void gs_divfail(const char *file, int line);
  GS_API GS_NORETURN void gs_divovf(const char *file, int line);
-@@ -812,8 +840,9 @@ typedef struct {
+@@ -840,8 +868,9 @@ typedef struct {
  } gs_stack;
  
  /* The program defines what goose.h gives C compiled on its own (gs_stack
@@ -437,17 +452,16 @@ index dc6d8dc8..f33914f2 100644
              if (binds[b].lib != l) continue;
  #ifdef _WIN32
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index 1630cf08..e4686c79 100644
+index 1db9abed..ce887f28 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
-@@ -193,10 +193,38 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
- GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
+@@ -204,6 +204,34 @@ GS_API GS_NORETURN void gs_abort(int err, const char *file, int line);
+ R"GSRT(GS_API GS_NORETURN void gs_abort_msg(const uint8_t *msg, int64_t len, const char *file,
                                       int line);
  GS_API GS_NORETURN void gs_exit(int64_t code);
 +/* What a library an extern block opens may take from the runtime: one that
 +   exports goose_runtime_hooks gets them as it is opened (gs_dl_bind), one
-+)GSRT"
-+R"GSRT(   linked into the program as the program starts. abort_msg ends the program
++   linked into the program as the program starts. abort_msg ends the program
 +   as abort(msg) does, or only the worker in a contained one; at_end has the
 +   runtime call a function when the program ends. */
 +typedef struct {
@@ -475,73 +489,68 @@ index 1630cf08..e4686c79 100644
 +GS_API void gs_rt_end_hooks(void);
  GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line);
  GS_API GS_NORETURN void gs_divfail(const char *file, int line);
--)GSRT"
--R"GSRT(GS_API GS_NORETURN void gs_divovf(const char *file, int line);
-+GS_API GS_NORETURN void gs_divovf(const char *file, int line);
- /* The debug build's failing overflow and `as` checks. */
- GS_API GS_NORETURN void gs_ovf(int64_t a, const char *op, int64_t b, const char *type,
-                                const char *file, int line);
-@@ -327,7 +355,8 @@ static inline int gs_simd_level(void) {
- #define GS_MEMZERO(d, n) \
+ GS_API GS_NORETURN void gs_divovf(const char *file, int line);
+@@ -335,7 +363,8 @@ static inline int gs_simd_level(void) {
+    power of two (which needs the runs not to overlap, as memcpy's do not).
+    TinyCC generates only the arm a constant condition selects, so these
+    macros compile to the stores alone or to the library call alone; the
+-   stores name d and s several times, which the compiler's operands allow
++)GSRT"
++R"GSRT(   stores name d and s several times, which the compiler's operands allow
+    (addresses of locals, fields, elements and data-stack tops). */
+ #ifdef __TINYC__
+ #define GS_KSZ(n, lo, hi) (__builtin_constant_p(n) && (n) >= (lo) && (n) <= (hi))
+@@ -356,8 +385,7 @@ static inline int gs_simd_level(void) {
      (GS_KSZ(n, 8, 8) ? (void)(GS_AT(uint64_t, d, 0) = 0) \
       : GS_KSZ(n, 4, 4) ? (void)(GS_AT(uint32_t, d, 0) = 0) \
--     : GS_KSZ(n, 1, 1) ? (void)(GS_AT(uint8_t, d, 0) = 0) \
-+)GSRT"
-+R"GSRT(     : GS_KSZ(n, 1, 1) ? (void)(GS_AT(uint8_t, d, 0) = 0) \
-      : GS_KSZ(n, 2, 2) ? (void)(GS_AT(uint16_t, d, 0) = 0) \
+      : GS_KSZ(n, 1, 1) ? (void)(GS_AT(uint8_t, d, 0) = 0) \
+-)GSRT"
+-R"GSRT(     : GS_KSZ(n, 2, 2) ? (void)(GS_AT(uint16_t, d, 0) = 0) \
++     : GS_KSZ(n, 2, 2) ? (void)(GS_AT(uint16_t, d, 0) = 0) \
       : GS_KSZ(n, 3, 3) ? (void)(GS_AT(uint16_t, d, 0) = 0, GS_AT(uint8_t, d, 2) = 0) \
       : GS_KSZ(n, 5, 7) ? (void)(GS_AT(uint32_t, d, 0) = 0, GS_AT(uint32_t, d, (n) - 4) = 0) \
-@@ -356,8 +385,7 @@ static uint64_t gs_bytemask(int64_t k) {
- }
- 
- /* memcpy, memmove and memcmp for a slice's elements. An empty slice's data
--)GSRT"
--R"GSRT(   pointer is NULL where the slice was zero-filled (default<T>(), a default
-+   pointer is NULL where the slice was zero-filled (default<T>(), a default
-    element), and C leaves all three undefined on a null pointer even for
-    zero bytes. A copy of up to 16 bytes loads both overlapping halves before
-    it stores them, and one of up to 256 bytes moves 16 at a time, the last 16
-@@ -490,7 +518,8 @@ static int gs_memeq(const void *a, const void *b, size_t n) {
+      : GS_KSZ(n, 9, 16) ? (void)(GS_AT(uint64_t, d, 0) = 0, GS_AT(uint64_t, d, (n) - 8) = 0) \
+@@ -494,7 +522,8 @@ static int gs_memeq(const void *a, const void *b, size_t n) {
+ #define gs_div_u64(a, b, f, l) GS_DIVU(uint64_t, a, b, f, l)
+ #define gs_mod_u8(a, b, f, l)  GS_MODU(uint8_t, a, b, f, l)
+ #define gs_mod_u16(a, b, f, l) GS_MODU(uint16_t, a, b, f, l)
+-#define gs_mod_u32(a, b, f, l) GS_MODU(uint32_t, a, b, f, l)
++)GSRT"
++R"GSRT(#define gs_mod_u32(a, b, f, l) GS_MODU(uint32_t, a, b, f, l)
+ #define gs_mod_u64(a, b, f, l) GS_MODU(uint64_t, a, b, f, l)
+ #define gs_mod_i8(t, a, b, f, l)  GS_MODS(int8_t, t, a, b, f, l)
+ #define gs_mod_i16(t, a, b, f, l) GS_MODS(int16_t, t, a, b, f, l)
+@@ -518,8 +547,7 @@ static int gs_memeq(const void *a, const void *b, size_t n) {
  static T gs_div_##SFX(T a, T b, const char *file, int line) { \
      if (b == 0) gs_divfail(file, line); \
      int64_t r = (int64_t)a / (int64_t)b; \
--    if (r < (MIN) || r > (MAX)) gs_ovf(a, "/", b, #SFX, file, line); \
-+)GSRT"
-+R"GSRT(    if (r < (MIN) || r > (MAX)) gs_ovf(a, "/", b, #SFX, file, line); \
+-)GSRT"
+-R"GSRT(    if (r < (MIN) || r > (MAX)) gs_ovf(a, "/", b, #SFX, file, line); \
++    if (r < (MIN) || r > (MAX)) gs_ovf(a, "/", b, #SFX, file, line); \
      return (T)r; }
  GS_DIVOPS_S(i8, int8_t, -128, 127)
  GS_DIVOPS_S(i16, int16_t, -32768, 32767)
-@@ -523,8 +552,7 @@ static T gs_neg_##SFX(T a, const char *file, int line) { \
-     if (r < MIN || r > MAX) gs_ovf_neg(a, #SFX, file, line); \
-     return (T)r; } \
- static T gs_shl_##SFX(T a, int64_t n) { \
--)GSRT"
--R"GSRT(    return (T)((uint64_t)a << (n & (BITS - 1))); } \
-+    return (T)((uint64_t)a << (n & (BITS - 1))); } \
- static T gs_shr_##SFX(T a, int64_t n) { \
-     return (T)((int64_t)a >> (n & (BITS - 1))); }
+@@ -662,7 +690,8 @@ static uint64_t gs_shr_u64(uint64_t a, int64_t n) { return a >> (n & 63); }
  
-@@ -665,7 +693,8 @@ static uint64_t gs_div128_u64(uint64_t hi, uint64_t d, uint64_t *rem) {
+ #endif  /* GS_DEBUG */
+ 
+-/* Unsigned division by a divisor a loop does not change, in libdivide's
++)GSRT"
++R"GSRT(/* Unsigned division by a divisor a loop does not change, in libdivide's
+    form: computed once before the loop (gs_divu_gen), x / d is then the high
+    half of a product, adjusted where GS_DIVU_ADD is in `more` and shifted
+    (gs_divu_q). A zero divisor, and a C compiler without 128-bit products,
+@@ -693,8 +722,7 @@ static uint64_t gs_div128_u64(uint64_t hi, uint64_t d, uint64_t *rem) {
      return (uint64_t)(n / d);
  #endif
  }
--#elif defined(_MSC_VER) && _MSC_VER >= 1920 && defined(_M_X64)
-+)GSRT"
-+R"GSRT(#elif defined(_MSC_VER) && _MSC_VER >= 1920 && defined(_M_X64)
+-)GSRT"
+-R"GSRT(#elif defined(_MSC_VER) && _MSC_VER >= 1920 && defined(_M_X64)
++#elif defined(_MSC_VER) && _MSC_VER >= 1920 && defined(_M_X64)
  #include <intrin.h>
  #define GS_HAVE_U128 1
  static uint64_t gs_mulhi_u64(uint64_t a, uint64_t b) { return __umulh(a, b); }
-@@ -711,8 +740,7 @@ static uint64_t gs_divu_q(uint64_t x, uint64_t magic, uint8_t more) {
-     return q >> more;
- #else
-     (void)magic;
--)GSRT"
--R"GSRT(    return x >> more;   /* Never called: GS_DIVU_NONE takes the operator. */
-+    return x >> more;   /* Never called: GS_DIVU_NONE takes the operator. */
- #endif
- }
- 
-@@ -828,8 +856,9 @@ typedef struct {
+@@ -856,15 +884,17 @@ typedef struct {
  } gs_stack;
  
  /* The program defines what goose.h gives C compiled on its own (gs_stack
@@ -553,47 +562,46 @@ index 1630cf08..e4686c79 100644
  #define GOOSE_H 1
  
  /* Starts the runtime on main's thread: the program's arguments, each
-@@ -859,7 +888,8 @@ GS_API void gs_release_regions(void);
- typedef struct gs_dllib {
+    region's usable reservation and trailing guard gap, the address space
+    budgeted for regions over the whole program, and the most regions the
+    main program and any one worker hold (the compiler's static counts),
+-   which size their registries and give hardware_threads() its cap. */
++)GSRT"
++R"GSRT(   which size their registries and give hardware_threads() its cap. */
+ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
+                         uint64_t budget, int64_t mainregions, int64_t workerregions);
+ /* A fresh region, registered to the calling thread program. */
+@@ -888,8 +918,7 @@ typedef struct gs_dllib {
      const char *name, *onwindows, *onmacos, *onlinux;
  } gs_dllib;
--/* One function: its library's index in the table, the symbol the library
-+)GSRT"
-+R"GSRT(/* One function: its library's index in the table, the symbol the library
-    is asked for, and the pointer the generated code calls through. */
+ /* One function: its library's index in the table, the symbol the library
+-)GSRT"
+-R"GSRT(   is asked for, and the pointer the generated code calls through. */
++   is asked for, and the pointer the generated code calls through. */
  typedef struct gs_dlbind {
      int32_t lib;
-@@ -886,8 +916,7 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
-    `msg` is not NULL, the first such wait for a worker that aborted takes its
-    message: `msg` and `len` are set to it, which the caller frees with
-    gs_free_msg, or to NULL and no bytes. */
--)GSRT"
--R"GSRT(GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
-+GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
-                                const char *file, int line);
- GS_API void gs_free_msg(uint8_t *msg);
- 
-@@ -1048,7 +1077,8 @@ static GS_NOINLINE int64_t gs_uleb_size_slow(const uint8_t *p) {
- }
- 
- #define GS_ULEB_READ(p) ((*(p) & 0x80) ? gs_uleb_read_slow(p) : (int64_t)*(p))
--#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
+     const char *sym;
+@@ -1043,7 +1072,8 @@ GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx,
+ static int64_t gs_uleb_read(const uint8_t *p) {
+     uint64_t v = 0;
+     int shift = 0;
+-    for (;;) {
 +)GSRT"
-+R"GSRT(#define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
- 
- static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
-     uint8_t *q = p;
-@@ -1087,8 +1117,7 @@ static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out
-         b = *q++;
-         if (shift > 63 || (shift == 63 && (b & 0x7e))) return 0;
++R"GSRT(    for (;;) {
+         uint8_t b = *p++;
          v |= (uint64_t)(b & 0x7f) << shift;
+         if (!(b & 0x80)) return (int64_t)v;
+@@ -1078,8 +1108,7 @@ static GS_NOINLINE int64_t gs_uleb_size_slow(const uint8_t *p) {
+ #define GS_ULEB_READ(p) ((*(p) & 0x80) ? gs_uleb_read_slow(p) : (int64_t)*(p))
+ #define GS_ULEB_SIZE(p) ((*(p) & 0x80) ? gs_uleb_size_slow(p) : (int64_t)1)
+ 
 -)GSRT"
--R"GSRT(        if (!(b & 0x80)) {
-+        if (!(b & 0x80)) {
-             if (shift && !b) return 0;  /* Redundant high zero group. */
-             break;
-         }
-@@ -1223,18 +1252,20 @@ static GS_TLS gs_contained *gs_contain;
+-R"GSRT(static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
++static int64_t gs_uleb_write(uint8_t *p, uint64_t v) {
+     uint8_t *q = p;
+     for (;;) {
+         uint8_t b = v & 0x7f;
+@@ -1251,18 +1280,20 @@ static GS_TLS gs_contained *gs_contain;
  static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, int line) {
      static const char lead[] = "goose runtime error: ";
      int64_t pre = sizeof lead - 1;
@@ -617,7 +625,7 @@ index 1630cf08..e4686c79 100644
      if (gs_contain) {
          memmove(text, text + pre, (size_t)(len + loc - 1));
          gs_contain->msg = text;
-@@ -1268,6 +1299,53 @@ GS_API GS_NORETURN void gs_exit(int64_t code) {
+@@ -1296,6 +1327,53 @@ GS_API GS_NORETURN void gs_exit(int64_t code) {
      gs_end((int)code);
  }
  
@@ -671,7 +679,7 @@ index 1630cf08..e4686c79 100644
  GS_API GS_NORETURN void gs_idxfail(int64_t i, int64_t n, const char *file, int line) {
      gs_failf(file, line, "index %lld out of bounds (length %lld)", (long long)i, (long long)n);
  }
-@@ -1313,7 +1391,8 @@ GS_API GS_NORETURN void gs_asfail_u(const char *why, uint64_t v, const char *typ
+@@ -1341,7 +1419,8 @@ GS_API GS_NORETURN void gs_asfail_u(const char *why, uint64_t v, const char *typ
  GS_API GS_NORETURN void gs_asfail_f(const char *why, double d, int f32, const char *type,
                                      const char *file, int line) {
      uint8_t num[32];
@@ -681,7 +689,7 @@ index 1630cf08..e4686c79 100644
      gs_asfail(why, (const char *)num, type, file, line);
  }
  
-@@ -1337,6 +1416,16 @@ static char **gs_argv;
+@@ -1365,6 +1444,16 @@ static char **gs_argv;
  static size_t gs_region_usable, gs_region_gap, gs_region_reserve, gs_region_page;
  /* The worker running on this thread, main's being -1 (runtime_threads.h). */
  static GS_TLS int64_t gs_current_thread_id = -1;
@@ -698,7 +706,7 @@ index 1630cf08..e4686c79 100644
  /* The program's address space budget for regions and the most regions its
     main program and any one worker can hold, as gs_rt_start was told, and
     the workers that leaves room for: what hardware_threads() reports at
-@@ -1346,8 +1435,7 @@ static int64_t gs_mainregions, gs_workerregions;
+@@ -1374,8 +1463,7 @@ static int64_t gs_mainregions, gs_workerregions;
  static int64_t gs_thread_cap = INT64_MAX;
  
  /* A region's own sizes travel with it: those reserved before a refusal
@@ -708,7 +716,7 @@ index 1630cf08..e4686c79 100644
  typedef struct {
      uint8_t *base;
      size_t usable, size;    /* size: with the guard gap */
-@@ -1494,7 +1582,8 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
+@@ -1522,7 +1610,8 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
                      "goose runtime error: out of memory committing a data stack\n";
                  DWORD written;
                  WriteFile(GetStdHandle(STD_ERROR_HANDLE), nomem, sizeof(nomem) - 1, &written,
@@ -718,7 +726,7 @@ index 1630cf08..e4686c79 100644
                  ExitProcess(1);
              }
              char msg[GS_OVERFLOW_TEXT];
-@@ -1561,8 +1650,7 @@ static GS_NORETURN void gs_park(void) {
+@@ -1589,8 +1678,7 @@ static GS_NORETURN void gs_park(void) {
  
  #include <sys/mman.h>
  #include <unistd.h>
@@ -728,7 +736,7 @@ index 1630cf08..e4686c79 100644
  #include <pthread.h>
  
  /* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
-@@ -1695,7 +1783,8 @@ static void gs_native_stack_init(void) {
+@@ -1723,7 +1811,8 @@ static void gs_native_stack_init(void) {
          void *base;
          size_t size;
          if (!pthread_getattr_np(pthread_self(), &attr)) {
@@ -738,7 +746,7 @@ index 1630cf08..e4686c79 100644
                  lo = (uintptr_t)base;
                  hi = lo + size;
              }
-@@ -1757,8 +1846,7 @@ static void gs_release_region(const gs_region *r) {
+@@ -1785,8 +1874,7 @@ static void gs_release_region(const gs_region *r) {
      if (munmap(r->base, r->size)) gs_panic("cannot release data stack address space");
  }
  
@@ -748,7 +756,7 @@ index 1630cf08..e4686c79 100644
     TinyCC names the memory orders in its stdatomic.h alone. */
  #ifndef __ATOMIC_SEQ_CST
  #define __ATOMIC_SEQ_CST 5
-@@ -1775,6 +1863,7 @@ static GS_NORETURN void gs_park(void) {
+@@ -1803,6 +1891,7 @@ static GS_NORETURN void gs_park(void) {
  
  static GS_NORETURN void gs_end(int code) {
      if (!gs_end_first()) gs_park();
@@ -756,7 +764,7 @@ index 1630cf08..e4686c79 100644
      fflush(NULL);
      #ifdef __TINYC__
          if (gs_current_thread_id < 0) exit(code);
-@@ -1888,7 +1977,8 @@ GS_API uint8_t gs_trim_memory(void) {
+@@ -1916,7 +2005,8 @@ GS_API uint8_t gs_trim_memory(void) {
  #else
          /* Linux walks only the page tables that were ever populated, so the
             untouched rest of the reservation costs it little. */
@@ -766,7 +774,7 @@ index 1630cf08..e4686c79 100644
  #endif
      }
      return (uint8_t)ok;
-@@ -1935,8 +2025,7 @@ typedef struct {
+@@ -1963,8 +2053,7 @@ typedef struct {
  #define GS_SPLEAF(p, i) ((gs_spleaf *)((p)->base + (i) * GS_SPAN_NODE))
  #define GS_SPINNER(p, i) ((gs_spinner *)((p)->base + (i) * GS_SPAN_NODE))
  
@@ -776,7 +784,7 @@ index 1630cf08..e4686c79 100644
      int64_t i = GS_SPHEAD(p)->chain;
      if (i) {
          GS_SPHEAD(p)->chain = GS_SPLEAF(p, i)->link;
-@@ -2106,7 +2195,8 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
+@@ -2134,7 +2223,8 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
          /* The node keeps its place above, and its new right half goes
             after it. */
          gs_sp_fix(p, l, INT64_MAX, 0);
@@ -786,7 +794,7 @@ index 1630cf08..e4686c79 100644
          leaf = 0;
          k = p->pos[l - 1] + 1;
          l--;
-@@ -2176,8 +2266,7 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
+@@ -2204,8 +2294,7 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
  }
  
  /* Takes cnt elements off the front of the span at position k of the path's
@@ -796,7 +804,7 @@ index 1630cf08..e4686c79 100644
  static void gs_sp_take(gs_sppath *p, int64_t k, int64_t cnt) {
      gs_spleaf *lf = GS_SPLEAF(p, p->node[p->h]);
      int64_t c = lf->cnt[k];
-@@ -2336,7 +2425,8 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt)
+@@ -2364,7 +2453,8 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt)
          /* The merged count is larger than both it replaces, so one fix
             covers the span after leaving the leaf as well. */
          if (next && nl == lf) gs_sp_close(lf, nk);
@@ -806,7 +814,7 @@ index 1630cf08..e4686c79 100644
          if (next && nl != lf) gs_sp_delete(s->np, nk);
      } else if (next) {
          int64_t c = nl->cnt[nk];
-@@ -2399,8 +2489,7 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
+@@ -2427,8 +2517,7 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
  
  /* ---------------------------------------------------------------------------
     Byte search: std's find_any and find_pair (docs/stdlib.md). A set arrives
@@ -816,7 +824,7 @@ index 1630cf08..e4686c79 100644
     Goose struct is (spec C.2: packed, in declaration order). `members` is
     the set. `kind` says how a block of bytes is tested for it: by comparing
     with 1 to 3 of `bytes` (kinds 1-3), or as the range bytes[0] .. bytes[0] +
-@@ -2542,7 +2631,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
+@@ -2570,7 +2659,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
  #define GS_ANY_LOOP(TEST)                                                              \
      int64_t i = 0;                                                                     \
      unsigned k;                                                                        \
@@ -826,7 +834,7 @@ index 1630cf08..e4686c79 100644
          k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + i)));                         \
          if (k) return i + gs_ctz32(k);                                                 \
      }                                                                                  \
-@@ -2578,8 +2668,7 @@ static GS_INLINE int64_t gs_scan_any_k(const uint8_t *p, int64_t n, const gs_byt
+@@ -2606,8 +2696,7 @@ static GS_INLINE int64_t gs_scan_any_k(const uint8_t *p, int64_t n, const gs_byt
      GS_ANY_LOOP(GS_TEST_S)
  }
  
@@ -836,7 +844,7 @@ index 1630cf08..e4686c79 100644
      gs_bsm ms;
      gs_bsm_init(&ms, s, 1);
      GS_ANY_LOOP(GS_TABLES_S)
-@@ -2710,7 +2799,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
+@@ -2738,7 +2827,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
     the digit count first, then the digits from the right, two per division
     by 100. */
  static const char gs_digit_pairs[201] =
@@ -846,7 +854,7 @@ index 1630cf08..e4686c79 100644
      "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
      "8081828384858687888990919293949596979899";
  
-@@ -2769,8 +2859,7 @@ typedef struct { int n; uint32_t d[36]; } gs_big;
+@@ -2797,8 +2887,7 @@ typedef struct { int n; uint32_t d[36]; } gs_big;
  /* a = v << sh, for v > 0. */
  static void gs_big_set(gs_big *a, uint64_t v, int sh) {
      int w = sh >> 5, b = sh & 31, i;
@@ -856,7 +864,7 @@ index 1630cf08..e4686c79 100644
      for (i = 0; i < w; i++) a->d[i] = 0;
      a->d[w] = (uint32_t)lo;
      a->d[w + 1] = (uint32_t)(lo >> 32);
-@@ -2929,7 +3018,8 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int
+@@ -2957,7 +3046,8 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int
              if (i == x + 1) *p++ = '.';
              *p++ = i < n ? dig[i] : '0';
          }
@@ -866,7 +874,7 @@ index 1630cf08..e4686c79 100644
          if (n <= x + 1) {
              *p++ = '.';
              *p++ = '0';
-@@ -4235,6 +4325,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+@@ -4296,6 +4386,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
                       spelling, (unsigned)GetLastError());
              gs_panic(msg);
          }
@@ -874,7 +882,7 @@ index 1630cf08..e4686c79 100644
  #else
          void *h = dlopen(spelling, RTLD_NOW | RTLD_LOCAL);
          if (!h) {
-@@ -4243,7 +4334,9 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
+@@ -4304,7 +4395,9 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
                       why ? why : "unknown error");
              gs_panic(msg);
          }
@@ -884,7 +892,7 @@ index 1630cf08..e4686c79 100644
          for (int64_t b = 0; b < nbinds; b++) {
              if (binds[b].lib != l) continue;
  #ifdef _WIN32
-@@ -4328,15 +4421,15 @@ GS_API int64_t gs_os_time_ns(void) {
+@@ -4389,15 +4482,15 @@ GS_API int64_t gs_os_time_ns(void) {
  }
  
  /* A monotonic clock in nanoseconds, for measuring intervals. */
@@ -903,7 +911,7 @@ index 1630cf08..e4686c79 100644
      clock_gettime(CLOCK_MONOTONIC, &ts);
      return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
  #endif
-@@ -4440,6 +4533,22 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+@@ -4501,6 +4594,22 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
      b.hdr->len += n;
  }
  
@@ -926,3 +934,36 @@ index 1630cf08..e4686c79 100644
  /* Appends `count` elements of `size` bytes each to the T[>..] a typed
     builder points at (spec 7.10): the bytes are the elements as Goose lays
     them out, packed, and the header counts elements, not bytes. */
+diff --git a/test/format.py b/test/format.py
+index 78305db1..46116e78 100644
+--- a/test/format.py
++++ b/test/format.py
+@@ -17,6 +17,9 @@ from doc_comments import SOURCE as DOC_SOURCE
+ 
+ # (name, input, expected output)
+ GOLDEN = [
++    ("reentrant externs",
++     'extern reentrant fn visit(x:i64)->i64;\nextern "lib"{reentrant fn callback();}\n',
++     'extern reentrant fn visit(x: i64) -> i64;\nextern "lib" { reentrant fn callback(); }\n'),
+     ("spacing",
+      "fn  f(a:i64,b :i64)->i64{a+b}\n",
+      "fn f(a: i64, b: i64) -> i64 { a + b }\n"),
+diff --git a/test/run_tests.py b/test/run_tests.py
+index d587a6ec..09db60d9 100755
+--- a/test/run_tests.py
++++ b/test/run_tests.py
+@@ -2093,6 +2093,14 @@ def main():
+             iface = {}
+         checks.append(("interface file honors -q", code == 0 and not out and not err and
+                        any(e.get("name") == "answer" for e in iface.get("exports", [])), out + err))
++        # Source dumps must preserve callback stack-publication semantics.
++        reentry_probe = gendir / "verbs_reentrant.goose"
++        tc.write_text(reentry_probe, 'extern reentrant fn visit(x: i64) -> i64;\n'
++                      'extern "lib" { reentrant fn callback(); }\nfn main() {}\n')
++        code, out, err = tc.run_capture([exe, "--parse", "--dump", reentry_probe])
++        checks.append(("dump preserves reentrant externs", code == 0 and
++                       "extern reentrant fn visit" in out and "reentrant fn callback" in out,
++                       out + err))
+         # Less than a page or two of data stack is no reservation to run on.
+         code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
+         checks.append(("check --stack-reserve 5000 (refused)",

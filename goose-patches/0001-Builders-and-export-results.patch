@@ -1,6 +1,6 @@
-From 5c8b078152a81c97d4972743c9371de5c68bb9b0 Mon Sep 17 00:00:00 2001
+From 71a121622ba1619125f3d19cafb2c3e5de75ae35 Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 00:38:28 +1100
+Date: Tue, 27 Oct 2026 01:01:31 +1100
 Subject: [PATCH] Support typed builders and multiple results across the native
  interface
 
@@ -9,7 +9,7 @@ Goose export results through C return values, output pointers and scratch
 builders. Include builder helpers in both public and embedded runtimes.
 Report the native value ABI and independently named capabilities.
 ---
- docs/goose_spec.md        |  29 ++++++--
+ docs/goose_spec.md        |  27 +++++--
  src/capabilities.h        |   5 ++
  src/codegen.h             |   1 +
  src/codegen_emit.h        | 144 +++++++++++++++++++++++++++++++-------
@@ -20,26 +20,24 @@ Report the native value ABI and independently named capabilities.
  src/typecheck.h           |   6 +-
  src/typecheck_calls.h     |  22 ++++--
  test/run_tests.py         |   4 +-
- 11 files changed, 219 insertions(+), 46 deletions(-)
+ 11 files changed, 218 insertions(+), 45 deletions(-)
  create mode 100644 src/capabilities.h
 
 diff --git a/docs/goose_spec.md b/docs/goose_spec.md
-index eb67619f..b114899a 100644
+index d539407f..a85ae506 100644
 --- a/docs/goose_spec.md
 +++ b/docs/goose_spec.md
-@@ -2895,7 +2895,10 @@ limited arrays, and fixed-mode ADTs), by value as its packed C type;
- (`{ data, len }`); and `u8[>..]&`, as the resizable's header plus its stack
- (`gs_rref`), which C appends to through `gs_bld_append(ref, p, n)`; C
- compiled on its own, a package's, finds both in `goose.h`
--(docs/packages.md).
-+(docs/packages.md). A typed builder, `T[>..]&` of such a `T`, crosses the
-+same way: C appends whole elements, laid out as Goose lays them out, at the
-+stack's top and counts them in the header's `len`, which
-+`gs_bld_push(ref, p, count, size)` does.
- Returns are one scalar or flat fixed-size value by value, or nothing;
- references, slices and builders are parameter-only forms. Everything
- else — varints, references inside structs, variable and resizable values
-@@ -2989,17 +2992,29 @@ export "c_sum" fn sum(a: i32, b: i32) -> i32 { a + b }
+@@ -3139,6 +3139,9 @@ These values can cross the boundary (with layouts per C.2):
+ * `u8[>..]&`, as the resizable's header plus its stack (`gs_rref`), which
+   C appends to through `gs_bld_append(ref, p, n)`. C compiled on its own,
+   such as a package's C, finds both in `goose.h` (docs/packages.md).
++* `T[>..]&` of a flat fixed-size `T`, using the same header and stack.
++  C appends whole elements in Goose's layout with
++  `gs_bld_push(ref, p, count, size)`; the header's `len` counts elements.
+ 
+ A return is one scalar or flat fixed-size value by value, or nothing;
+ references, slices and builders can only be parameters. Everything else
+@@ -3239,17 +3242,29 @@ export "c_sum" fn sum(a: i32, b: i32) -> i32 { a + b }
  
  An `export fn` defines a normal Goose function and emits a C-callable wrapper.
  The optional string names its C symbol; otherwise the function's leaf name is
@@ -99,10 +97,10 @@ index 14dd29d0..26dd84eb 100644
      void EmitMain();
  
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 3ccfe5ec..26773948 100644
+index 70c5027b..c046754f 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
-@@ -883,8 +883,8 @@ inline void CodeGen::EmitProgramInit() {
+@@ -887,8 +887,8 @@ inline void CodeGen::EmitProgramInit() {
      }
      Append(code, "static void gs_program_init(int argc, char **argv) {\n"
                   "    if (gs_program_initialized) return;\n"
@@ -113,7 +111,7 @@ index 3ccfe5ec..26773948 100644
      // The shared libraries' functions, before a global's initializer could
      // call one: on the main thread, before any worker exists, so the
      // pointers are written once here and read thereafter without
-@@ -919,45 +919,141 @@ inline string CodeGen::MainCall() {
+@@ -923,45 +923,141 @@ inline string CodeGen::MainCall() {
      return cat("    ", mi.cname, "(", mi.needssp ? "0" : "", ");\n");
  }
  
@@ -278,7 +276,7 @@ index 3ccfe5ec..26773948 100644
          Append(code, "}\n\n");
      }
 diff --git a/src/main.cpp b/src/main.cpp
-index b143c3fb..0c3f9b92 100644
+index 725c0ed9..0af5a75b 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -39,6 +39,7 @@
@@ -289,10 +287,10 @@ index b143c3fb..0c3f9b92 100644
  #include "process.h"
  #include "jit.h"
  #include "progress.h"
-@@ -1049,6 +1050,7 @@ int Main(int argc, char **argv) {
+@@ -1321,6 +1322,7 @@ int Main(int argc, char **argv) {
      }
      if (verb == "version") {
-         printf("goose runtime %s\n", RuntimeVersion().c_str());
+         printf("goose %s (runtime %s)\n", CompilerVersion(), RuntimeVersion().c_str());
 +        printf("features: %s\nnative-abi: %d\n", GOOSE_FEATURES, GOOSE_NATIVE_ABI);
          return 0;
      }
@@ -328,7 +326,7 @@ index a1624034..3819ad62 100644
 +
  #endif
 diff --git a/src/runtime/runtime_ext.h b/src/runtime/runtime_ext.h
-index 241432b5..8a29d02e 100644
+index d8684489..c59b9140 100644
 --- a/src/runtime/runtime_ext.h
 +++ b/src/runtime/runtime_ext.h
 @@ -26,6 +26,15 @@ static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
@@ -348,10 +346,10 @@ index 241432b5..8a29d02e 100644
     library handed back as a u64, copied into a builder, so nothing foreign
     is a Goose value without a copy. The pointer is trusted as every extern
 diff --git a/src/runtime_inline.h b/src/runtime_inline.h
-index c2292af2..1630cf08 100644
+index 862f12e0..1db9abed 100644
 --- a/src/runtime_inline.h
 +++ b/src/runtime_inline.h
-@@ -3461,6 +3461,15 @@ static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+@@ -3489,6 +3489,15 @@ static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
      b.hdr->len += n;
  }
  
@@ -367,24 +365,27 @@ index c2292af2..1630cf08 100644
  /* ffi's cstr and bytes (stdlib/ffi.goose): the bytes at a pointer a C
     library handed back as a u64, copied into a builder, so nothing foreign
     is a Goose value without a copy. The pointer is trusted as every extern
-@@ -3621,13 +3630,13 @@ GS_API uint8_t gs_os_getenv(sl_u8 name, gs_rref out);
- GS_API uint8_t gs_os_resource_dir(gs_rref out);
- GS_API int64_t gs_os_time_ns(void);
- GS_API int64_t gs_os_clock_ns(void);
--GS_API void gs_os_sleep_ms(int64_t ms);
+@@ -3628,7 +3637,8 @@ static int64_t gs_popcount(uint64_t x) {
+ #endif
+ }
+ static int64_t gs_clz(uint64_t x) {
+-#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
 +)GSRT"
-+R"GSRT(GS_API void gs_os_sleep_ms(int64_t ms);
- GS_API uint64_t gs_os_random_u64(void);
- /* os.trim_memory: discards unused complete pages of this thread program's
-    data stacks. Defined with the region registry it walks (runtime_impl.h),
-    but declared here like the other os primitives, so that no prototype is
++R"GSRT(#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
+     return x ? __builtin_clzll(x) : 64;
+ #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+     unsigned long i;
+@@ -3640,8 +3650,7 @@ static int64_t gs_clz(uint64_t x) {
+         x <<= 1;
+         n++;
+     }
 -)GSRT"
--R"GSRT(   emitted for it. For generated code only, whose callers write back their
-+   emitted for it. For generated code only, whose callers write back their
-    cached tops first; C called from Goose must not call it. 0 means an OS
-    request failed; a top outside its region panics. */
- GS_API uint8_t gs_trim_memory(void);
-@@ -4396,7 +4405,9 @@ R"GSRT(/* goose.h -- for C compiled on its own, a package's or a program's sidec
+-R"GSRT(    return n;
++    return n;
+ #endif
+ }
+ static int64_t gs_ctz(uint64_t x) {
+@@ -4457,7 +4466,9 @@ R"GSRT(/* goose.h -- for C compiled on its own, a package's or a program's sidec
     cannot spell from the layouts alone (spec §7.10, C.2). A `u8[>..]&`
     parameter arrives as a gs_rref, the resizable's header and its data
     stack, and C appends to it with gs_bld_append; the stack's top is where
@@ -395,7 +396,7 @@ index c2292af2..1630cf08 100644
  
     The compiler writes this header beside every native part it builds and
     puts it on that part's include path, `#include "goose.h"`, and builds
-@@ -4429,6 +4440,16 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
+@@ -4490,6 +4501,16 @@ static inline void gs_bld_append(gs_rref b, const void *p, int64_t n) {
      b.hdr->len += n;
  }
  
@@ -437,10 +438,10 @@ index f13bb5a4..52dc8dd9 100644
                  // Its class's storage is a value of the type it refers to.
                  if (t->kind == TY_REF) {
 diff --git a/src/typecheck_calls.h b/src/typecheck_calls.h
-index 4c58d0ca..c25f421b 100644
+index 9e9d9c02..440640a8 100644
 --- a/src/typecheck_calls.h
 +++ b/src/typecheck_calls.h
-@@ -2553,7 +2553,15 @@ inline bool TypeCheck::ExternParamOk(TypeExpr *t, string &why) {
+@@ -2554,7 +2554,15 @@ inline bool TypeCheck::ExternParamOk(TypeExpr *t, string &why) {
              return false;
          }
          auto s = t->ref->sub;
@@ -457,7 +458,7 @@ index 4c58d0ca..c25f421b 100644
          return ExternValueOk(s, why);
      }
      if (t->kind == TY_SLICE) return ExternValueOk(t->sub, why);
-@@ -2696,17 +2704,17 @@ inline void TypeCheck::CheckExport(SFunction *sf) {
+@@ -2697,17 +2705,17 @@ inline void TypeCheck::CheckExport(SFunction *sf) {
          if (!ExternParamOk(t, why))
              fail(cat("parameter ", sf->params[i].name, " of type ", TypeStr(t),
                       " cannot cross to C: ", why));
@@ -482,18 +483,17 @@ index 4c58d0ca..c25f421b 100644
          ValidateType(t, sf->line, VT_LOCAL);
          if (t->kind == TY_SLICE && IsU8(t->sub)) {
 diff --git a/test/run_tests.py b/test/run_tests.py
-index 76eadb22..dfabb947 100755
+index 8c12b159..9eaaf42b 100755
 --- a/test/run_tests.py
 +++ b/test/run_tests.py
-@@ -1923,8 +1923,10 @@ def main():
+@@ -2000,7 +2000,9 @@ def main():
+                        "verbs" not in out, out + err))
          code, out, err = tc.run_capture([exe, "run", "-o", str(gendir / "verbs.c"), probe])
          checks.append(("run -o (refused)", code != 0 and "takes no -o" in err, out + err))
+-        version = re.compile(r"goose \S+ \(runtime [0-9a-f]{12}\)\s*$")
++        # Preserve upstream compiler version output before optional native capabilities.
++        version = re.compile(r"goose \S+ \(runtime [0-9a-f]{12}\)\n"
++                             r"(features: [a-z -]+\nnative-abi: [0-9]+\n)?\s*$")
          code, out, err = tc.run_capture([exe, "version"])
-+        # Native interface capabilities and ABI are reported after the runtime hash.
-         checks.append(("version", code == 0 and
--                       re.match(r"goose runtime [0-9a-f]{12}\s*$", out) is not None, out + err))
-+                       re.match(r"goose runtime [0-9a-f]{12}\n(features: [a-z -]+\nnative-abi: [0-9]+\n)?\s*$", out) is not None,
-+                       out + err))
-         # Less than a page or two of data stack is no reservation to run on.
-         code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
-         checks.append(("check --stack-reserve 5000 (refused)",
+         checks.append(("version", code == 0 and version.match(out) is not None, out + err))
+         code, out2, err = tc.run_capture([exe, "--version"])

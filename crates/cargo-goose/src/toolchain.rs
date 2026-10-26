@@ -69,13 +69,22 @@ pub fn goose_info(goose: &Path) -> Result<GooseInfo, String> {
 pub fn parse_goose_info(text: &str) -> Result<GooseInfo, String> {
     let mut info = GooseInfo::default();
     for line in text.lines() {
-        if let Some(r) = line.trim().strip_prefix("goose runtime ") {
-            info.runtime = r.trim().to_string();
+        let line = line.trim();
+        if let Some(report) = line.strip_prefix("goose ") {
+            // Older compilers print only the runtime; current upstream includes
+            // the compiler version before a parenthesized runtime hash.
+            if let Some(runtime) = report.strip_prefix("runtime ") {
+                info.runtime = runtime.trim().to_string();
+            } else if let Some((_, runtime)) = report.rsplit_once(" (runtime ") {
+                if let Some(runtime) = runtime.strip_suffix(')') {
+                    info.runtime = runtime.to_string();
+                }
+            }
         }
-        if let Some(f) = line.trim().strip_prefix("features:") {
+        if let Some(f) = line.strip_prefix("features:") {
             info.features = f.split_whitespace().map(|s| s.to_string()).collect();
         }
-        if let Some(abi) = line.trim().strip_prefix("native-abi:") {
+        if let Some(abi) = line.strip_prefix("native-abi:") {
             info.native_abi = Some(abi.trim().parse().map_err(|_| "invalid native ABI version")?);
         }
     }
@@ -86,8 +95,9 @@ pub fn parse_goose_info(text: &str) -> Result<GooseInfo, String> {
 }
 
 /// The Goose runtimes whose value layouts (slices, builders, stacks) bridge
-/// ABI 1 was checked against: the pinned commit, stock and patched.
-pub const KNOWN_RUNTIMES: &[&str] = &["a5dbd11b6309"];
+/// ABI 1 was checked against: the current and previous pinned stock compilers.
+/// Patched compilers advertise the native ABI directly.
+pub const KNOWN_RUNTIMES: &[&str] = &["fba599d313fe", "a5dbd11b6309"];
 
 /// Refuses a compiler whose runtime this bridge was not checked against,
 /// naming both, unless `allow` (a newer compiler that kept the layouts).

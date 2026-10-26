@@ -10,7 +10,7 @@
 # too, GOOSE_REPO=~/github/goose, as long as it has the pinned commit.
 set -euo pipefail
 
-GOOSE_COMMIT=e76d5c9f7f0a17d83c12a405fbb2513094d03985
+GOOSE_COMMIT=a108677d300cb0e8bbb842c35a353abe67a20c6c
 GOOSE_REPO=${GOOSE_REPO:-https://github.com/aardappel/goose.git}
 
 root=$(cd "$(dirname "$0")/.." && pwd)

@@ -129,9 +129,9 @@ in place.
 
 `native::fill_squares(4, values)` can name an ordinary Goose function. The
 namespace does not imply a foreign call; `extern` establishes that boundary.
-A local comparison of the pinned stock and patched compilers found that
-an all-Goose typed-builder example emitted identical caller/callee bodies
-at `-O0` and identical inlined caller bodies at `-O2`.
+With upstream pin `a108677d`, the all-Goose typed-builder example emitted
+identical stock/patched caller and callee bodies at `-O0`, and identical
+inlined caller bodies at `-O2`.
 
 The complete generated programs differed: the patched version contained
 an empty `gs_register_reentry()` call and `gs_rt_end_hooks()` at shutdown,

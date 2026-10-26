@@ -1,6 +1,6 @@
-From 60cceb3af6263cf0f3afe8002984c9a502cae43d Mon Sep 17 00:00:00 2001
+From f3777dd54c5a3af35d490e130321f20074ede67f Mon Sep 17 00:00:00 2001
 From: Goose contributors <goose@example.invalid>
-Date: Tue, 27 Oct 2026 00:38:28 +1100
+Date: Tue, 27 Oct 2026 01:03:05 +1100
 Subject: [PATCH] Build native libraries through external providers
 
 Accept a versioned library report from an external build command, with
@@ -21,10 +21,10 @@ and response-file handling with MSVC.
  create mode 100644 src/native_build.h
 
 diff --git a/docs/packages.md b/docs/packages.md
-index ffe04508..30444b4e 100644
+index 364a715c..54f282a1 100644
 --- a/docs/packages.md
 +++ b/docs/packages.md
-@@ -228,6 +228,43 @@ void mylib_name(gs_rref out, int64_t id) {   /* extern fn mylib_name(out: u8[>..
+@@ -255,6 +255,43 @@ void mylib_name(gs_rref out, int64_t id) {   /* extern fn mylib_name(out: u8[>..
  }
  ```
  
@@ -69,7 +69,7 @@ index ffe04508..30444b4e 100644
  repository, as `gfx`, `audio` and `ui` do. A package whose functions keep
  one state for the process, or that may only be called from the main thread,
 diff --git a/src/ast.h b/src/ast.h
-index 5628c2fe..b30fe1ce 100644
+index d0e0de29..d00183df 100644
 --- a/src/ast.h
 +++ b/src/ast.h
 @@ -2375,8 +2375,16 @@ struct Package {
@@ -140,10 +140,10 @@ index 8f27d976..6210947f 100644
 -#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks reentrant"
 +#define GOOSE_FEATURES "typed-builders export-results emit-interface runtime-hooks native-build reentrant"
 diff --git a/src/codegen_emit.h b/src/codegen_emit.h
-index 1267dce2..c15be11e 100644
+index 9c09add8..1fa1b2a9 100644
 --- a/src/codegen_emit.h
 +++ b/src/codegen_emit.h
-@@ -895,6 +895,20 @@ inline void CodeGen::EmitProgramInit() {
+@@ -899,6 +899,20 @@ inline void CodeGen::EmitProgramInit() {
      if (!dllibs.empty())
          Append(code, "    gs_dl_bind(gs_dllibs, ", dllibs.size(), ", gs_dlbinds, ", dlbinds,
                 ");\n");
@@ -165,7 +165,7 @@ index 1267dce2..c15be11e 100644
      Append(code, "    gs_register_reentry();\n");
      // The queues, before anything that could use one runs.
 diff --git a/src/main.cpp b/src/main.cpp
-index 0fd1b18b..705e0086 100644
+index 47be09ca..bc7130ed 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -50,6 +50,7 @@
@@ -174,9 +174,9 @@ index 0fd1b18b..705e0086 100644
  #include "packages.h"
 +#include "native_build.h"
  #include "native.h"
+ #include "format.h"
  #include "lsp_rpc.h"
- #include "lsp_analysis.h"
-@@ -1290,10 +1291,14 @@ int Main(int argc, char **argv) {
+@@ -1573,10 +1574,14 @@ int Main(int argc, char **argv) {
          auto &ast = *astp;
          if (jsondiag) ast.sink = [&](const Diagnostic &d) { found.push_back(d); };
          auto stdlibdirs = StdlibDirs(stdlibdir, exe);
