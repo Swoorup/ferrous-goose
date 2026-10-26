@@ -140,7 +140,10 @@ jobs:
         run: |
           chmod +x goose/build/goose* || true
           G=$PWD/goose/build/goose
-          rm -rf ~/.cargo/bin ~/.rustup || true
+          # Keep system tools only, including in Git Bash. Rust may also be
+          # installed through Homebrew or another runner-wide tool directory.
+          export PATH=/usr/bin:/bin
+          hash -r
           if command -v cargo || command -v rustc; then echo "Rust is still on PATH"; exit 1; fi
           fail=0
           for ex in packages/*/dist/examples/*.goose; do
